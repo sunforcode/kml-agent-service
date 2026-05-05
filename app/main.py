@@ -1,0 +1,372 @@
+"""
+KML Agent Service - FastAPI主入口
+
+这是KML智能分析服务的主入口文件。
+
+服务功能:
+1. POST /api/v1/analyze - 提交KML分析任务
+2. GET /api/v1/tasks/{task_id} - 查询任务状态
+3. GET /health - 健康检查
+
+工作流程:
+1. 后端(walkbg)调用POST /api/v1/analyze提交KML URL
+2. 服务返回task_id，异步执行分析
+3. 后端调用GET /api/v1/tasks/{task_id}查询状态
+4. 分析完成后返回EnhancedRouteOutput格式数据
+
+当前实现状态:
+- 所有Agent通过注释说明职责
+- 返回假数据供迭代开发
+- 后续逐步完善各Agent真实逻辑
+"""
+
+import logging
+import asyncio
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Dict, Any, Optional
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from app.core.config import settings
+from app.models.request import KmlAnalysisRequest
+from app.models.response import (
+    TaskSubmitResponse,
+    TaskStatusResponse,
+    HealthResponse
+)
+from app.services.task_service import task_manager, TaskStatus
+from app.services.callback_service import callback_service
+from app.agents.orchestrator_agent import OrchestratorAgent
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO if not settings.debug else logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# 全局编排Agent实例
+orchestrator: Optional[OrchestratorAgent] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI生命周期管理
+    
+    启动时初始化编排Agent，关闭时清理资源
+    """
+    global orchestrator
+    
+    logger.info("=" * 60)
+    logger.info(f"启动 {settings.service_name} v{settings.service_version}")
+    logger.info(f"环境: {settings.environment}")
+    logger.info(f"调试模式: {settings.debug}")
+    logger.info("=" * 60)
+    
+    # 初始化编排Agent
+    logger.info("初始化编排Agent...")
+    orchestrator = OrchestratorAgent()
+    logger.info("编排Agent初始化完成")
+    
+    yield
+    
+    # 清理资源
+    logger.info("服务关闭，清理资源...")
+
+
+# 创建FastAPI应用
+app = FastAPI(
+    title="KML Agent Service",
+    description="KML智能分析服务 - 使用AI Agent分析徒步路线数据",
+    version=settings.service_version,
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# 配置CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 后续可配置为具体域名
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ========================================
+# 健康检查端点
+# ========================================
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """
+    健康检查端点
+    
+    返回服务状态和版本信息
+    """
+    return HealthResponse(
+        status="healthy",
+        version=settings.service_version,
+        timestamp=datetime.utcnow(),
+        checks={
+            "orchestrator": "ready" if orchestrator else "not_initialized"
+        }
+    )
+
+
+# ========================================
+# 任务管理端点
+# ========================================
+
+@app.post("/api/v1/analyze", response_model=TaskSubmitResponse)
+async def submit_analysis(
+    request: KmlAnalysisRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    提交KML分析任务
+    
+    接收KML文件URL或内容，创建分析任务并异步执行。
+    
+    Args:
+        request: KML分析请求
+            - route_id: 关联的walkbg路线ID（可选）
+            - kml_source: KML文件URL（必填）
+            - kml_content: KML内容字符串（优先级高于URL）
+            - enable_content_generation: 是否启用内容生成（LLM调用）
+            - enable_poi_query: 是否启用OSM POI查询
+            - poi_search_radius: POI搜索半径（米）
+            - region_name: 区域名称提示
+            - estimated_difficulty: 预估难度
+            - user_notes: 用户备注
+        
+        background_tasks: FastAPI后台任务
+    
+    Returns:
+        TaskSubmitResponse: 任务提交响应
+            - task_id: 任务ID
+            - status: 任务状态（pending）
+            - message: 提示消息
+            - estimated_seconds: 预估完成时间（秒）
+    
+    示例:
+        POST /api/v1/analyze
+        {
+            "kml_source": "http://walkbg:8080/static/kml/wutaishan.kml",
+            "enable_content_generation": true,
+            "region_name": "五台山"
+        }
+    """
+    logger.info(f"收到分析请求: kml_source={request.kml_source}")
+    
+    # 检查编排Agent是否就绪
+    if not orchestrator:
+        raise HTTPException(
+            status_code=503,
+            detail="服务未就绪，请稍后重试"
+        )
+    
+    # 创建任务
+    task_id = task_manager.create_task(
+        request=request.model_dump(),
+        estimated_seconds=60
+    )
+    
+    # 添加后台任务执行分析
+    background_tasks.add_task(
+        execute_analysis_async,
+        task_id,
+        request.model_dump()
+    )
+    
+    logger.info(f"任务已创建: {task_id}")
+    
+    return TaskSubmitResponse(
+        task_id=task_id,
+        status="pending",
+        message="分析任务已提交，正在执行中",
+        estimated_seconds=60
+    )
+
+
+@app.get("/api/v1/tasks/{task_id}", response_model=TaskStatusResponse)
+async def get_task_status(task_id: str):
+    """
+    查询任务状态
+    
+    根据任务ID查询分析任务的执行状态和结果。
+    
+    Args:
+        task_id: 任务ID（从POST /api/v1/analyze返回）
+    
+    Returns:
+        TaskStatusResponse: 任务状态响应
+            - task_id: 任务ID
+            - status: 任务状态
+                - pending: 等待执行
+                - processing: 执行中
+                - completed: 已完成
+                - failed: 失败
+            - progress: 进度百分比（0-100）
+            - current_step: 当前执行步骤
+            - message: 状态消息
+            - result: 分析结果（仅当status=completed时返回）
+            - error: 错误信息（仅当status=failed时返回）
+    
+    示例:
+        GET /api/v1/tasks/task_abc123def456
+        
+        响应:
+        {
+            "task_id": "task_abc123def456",
+            "status": "completed",
+            "progress": 100,
+            "current_step": "aggregate_result",
+            "message": "分析完成",
+            "result": {
+                "total_distance_km": 52.3,
+                "total_elevation_gain_m": 2800,
+                "segments": [...],
+                "water_sources": [...],
+                ...
+            }
+        }
+    """
+    task = task_manager.get_task(task_id)
+    
+    if not task:
+        raise HTTPException(
+            status_code=404,
+            detail=f"任务不存在: {task_id}"
+        )
+    
+    # 构建响应
+    response = TaskStatusResponse(
+        task_id=task_id,
+        status=task["status"].value if hasattr(task["status"], "value") else task["status"],
+        progress=task.get("progress", 0),
+        current_step=task.get("current_step"),
+        message=task.get("message", "")
+    )
+    
+    # 如果完成，返回结果
+    if task["status"] == TaskStatus.COMPLETED and task.get("result"):
+        response.result = task["result"]
+    
+    # 如果失败，返回错误
+    if task["status"] == TaskStatus.FAILED and task.get("error"):
+        response.error = task["error"]
+    
+    return response
+
+
+# ========================================
+# 后台任务执行
+# ========================================
+
+async def execute_analysis_async(task_id: str, request_dict: Dict[str, Any]):
+    """
+    异步执行KML分析
+    
+    在后台线程中执行完整的分析工作流。
+    
+    Args:
+        task_id: 任务ID
+        request_dict: 分析请求字典
+    """
+    logger.info(f"开始执行任务: {task_id}")
+    
+    route_id = request_dict.get("route_id")
+    result = None
+    
+    try:
+        task_manager.update_task_status(
+            task_id,
+            TaskStatus.PROCESSING,
+            progress=5,
+            current_step="init",
+            message="开始分析"
+        )
+        
+        if orchestrator:
+            result = await orchestrator.execute_workflow(request_dict)
+            
+            task_manager.set_task_result(task_id, result)
+            
+            logger.info(f"任务完成: {task_id}")
+            
+            await callback_service.send_callback(
+                task_id=task_id,
+                route_id=route_id,
+                result=result,
+                status="completed"
+            )
+        else:
+            raise Exception("编排Agent未初始化")
+            
+    except Exception as e:
+        logger.error(f"任务执行失败: {task_id}, 错误: {str(e)}", exc_info=True)
+        task_manager.set_task_error(task_id, str(e))
+        
+        error_result = {
+            "error": str(e),
+            "warnings": [{"level": "error", "message": str(e)}]
+        }
+        await callback_service.send_callback(
+            task_id=task_id,
+            route_id=route_id,
+            result=error_result,
+            status="failed"
+        )
+
+
+# ========================================
+# 开发辅助端点（仅调试模式可用）
+# ========================================
+
+if settings.debug:
+    @app.get("/api/v1/debug/tasks")
+    async def get_all_tasks():
+        """
+        [调试] 获取所有任务列表
+        
+        仅在调试模式(DEBUG=true)下可用。
+        """
+        return {
+            "total": len(task_manager.get_all_tasks()),
+            "tasks": task_manager.get_all_tasks()
+        }
+    
+    @app.post("/api/v1/debug/cleanup")
+    async def cleanup_tasks():
+        """
+        [调试] 清理过期任务
+        
+        仅在调试模式下可用。
+        """
+        count = task_manager.cleanup_old_tasks(max_age_hours=1)
+        return {"cleaned_tasks": count}
+
+
+# ========================================
+# 启动说明
+# ========================================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    logger.info(f"启动服务: http://{settings.host}:{settings.port}")
+    logger.info(f"API文档: http://{settings.host}:{settings.port}/docs")
+    
+    uvicorn.run(
+        "app.main:app",
+        host=settings.host,
+        port=settings.port,
+        reload=settings.debug
+    )
