@@ -1,88 +1,39 @@
-# ========================================
-# KML Agent Service - 环境变量配置示例
-# ========================================
-# 复制此文件为 .env 并填入实际值
-# 注意: .env 文件不应提交到Git仓库
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
 
-# ========================================
-# 服务基础配置
-# ========================================
-SERVICE_NAME=kml-agent-service
-SERVICE_VERSION=1.0.0
+# Virtual environments
+venv/
+env/
+.venv/
+.env.local
 
-# 环境: development / production
-ENVIRONMENT=development
+# 环境变量（含敏感信息，不提交）
+.env
 
-# 调试模式: true / false
-DEBUG=true
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
 
-# ========================================
-# FastAPI 配置
-# ========================================
-HOST=0.0.0.0
-PORT=8001
+# macOS
+.DS_Store
 
-# ========================================
-# LLM 配置（必需）
-# ========================================
-# OpenAI API Key
-OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# Logs
+*.log
+logs/
 
-# 使用的模型
-# 推荐: gpt-4o-mini (成本低，能力足够)
-# 备选: gpt-3.5-turbo
-OPENAI_MODEL=gpt-4o-mini
-
-# LLM温度参数 (0.0-1.0)
-# 较低值: 更确定、更一致
-# 较高值: 更随机、更有创意
-OPENAI_TEMPERATURE=0.7
-
-# 最大输出Token数
-OPENAI_MAX_TOKENS=4000
-
-# ========================================
-# 外部 API 配置（可选，有默认值）
-# ========================================
-# Nominatim逆地理编码
-NOMINATIM_URL=https://nominatim.openstreetmap.org
-NOMINATIM_TIMEOUT=10
-
-# Overpass API (OSM POI查询)
-OVERPASS_URL=https://overpass-api.de/api/interpreter
-OVERPASS_TIMEOUT=30
-
-# ========================================
-# WalkBG 回调配置
-# ========================================
-# WalkBG服务地址
-WALKBG_BASE_URL=http://localhost:8080
-
-# 回调端点路径
-WALKBG_CALLBACK_ENDPOINT=/walkbg/api/v1/route-analysis/callback
-
-# 是否启用回调
-WALKBG_CALLBACK_ENABLED=true
-
-# API超时时间（秒）
-WALKBG_API_TIMEOUT=30
-
-# ========================================
-# 分析配置
-# ========================================
-# POI搜索半径（米）
-POI_SEARCH_RADIUS=500
-
-# 是否默认启用内容生成
-ENABLE_CONTENT_GENERATION=true
-
-# 是否默认启用POI查询
-ENABLE_POI_QUERY=true
-
-# ========================================
-# Redis 配置（可选，用于持久化）
-# ========================================
-# 当前MVP版本使用内存存储
-# 后续可扩展到Redis
-# REDIS_URL=redis://localhost:6379/0
-# REDIS_TIMEOUT=5
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
