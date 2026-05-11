@@ -40,7 +40,7 @@ from app.models.response import (
 )
 from app.services.task_service import task_manager, TaskStatus
 from app.services.callback_service import callback_service
-from app.agents.orchestrator_agent import OrchestratorAgent
+from app.agents.analysis_workflow import AnalysisWorkflow
 
 # 配置日志
 logging.basicConfig(
@@ -49,8 +49,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 全局编排Agent实例
-orchestrator: Optional[OrchestratorAgent] = None
+# 全局工作流实例
+workflow: Optional[AnalysisWorkflow] = None
 
 
 @asynccontextmanager
@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
     
     启动时初始化编排Agent，关闭时清理资源
     """
-    global orchestrator
+    global workflow
     
     logger.info("=" * 60)
     logger.info(f"启动 {settings.service_name} v{settings.service_version}")
@@ -68,10 +68,10 @@ async def lifespan(app: FastAPI):
     logger.info(f"调试模式: {settings.debug}")
     logger.info("=" * 60)
     
-    # 初始化编排Agent
-    logger.info("初始化编排Agent...")
-    orchestrator = OrchestratorAgent()
-    logger.info("编排Agent初始化完成")
+    # 初始化分析工作流
+    logger.info("初始化分析工作流...")
+    workflow = AnalysisWorkflow()
+    logger.info("分析工作流初始化完成")
     
     yield
     
@@ -115,7 +115,7 @@ async def health_check():
         version=settings.service_version,
         timestamp=datetime.utcnow(),
         checks={
-            "orchestrator": "ready" if orchestrator else "not_initialized"
+            "workflow": "ready" if workflow else "not_initialized"
         }
     )
 
@@ -165,8 +165,8 @@ async def submit_analysis(
     """
     logger.info(f"收到分析请求: kml_source={request.kml_source}")
     
-    # 检查编排Agent是否就绪
-    if not orchestrator:
+    # 检查工作流是否就绪
+    if not workflow:
         raise HTTPException(
             status_code=503,
             detail="服务未就绪，请稍后重试"
@@ -294,8 +294,8 @@ async def execute_analysis_async(task_id: str, request_dict: Dict[str, Any]):
             message="开始分析"
         )
         
-        if orchestrator:
-            result = await orchestrator.execute_workflow(request_dict)
+        if workflow:
+            result = await workflow.execute_workflow(request_dict)
             
             task_manager.set_task_result(task_id, result)
             
@@ -308,7 +308,7 @@ async def execute_analysis_async(task_id: str, request_dict: Dict[str, Any]):
                 status="completed"
             )
         else:
-            raise Exception("编排Agent未初始化")
+            raise Exception("分析工作流未初始化")
             
     except Exception as e:
         logger.error(f"任务执行失败: {task_id}, 错误: {str(e)}", exc_info=True)

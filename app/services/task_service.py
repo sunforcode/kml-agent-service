@@ -12,7 +12,9 @@
 - 后续可扩展到Redis
 """
 
+import json
 import logging
+import math
 import uuid
 from datetime import datetime
 from typing import Dict, Any, Optional, List
@@ -159,7 +161,8 @@ class TaskManager:
         if not task:
             return False
         
-        task["result"] = result
+        # 将 numpy 等不可序列化类型转换为 Python 原生类型
+        task["result"] = _sanitize_for_json(result)
         task["status"] = TaskStatus.COMPLETED
         task["progress"] = 100
         task["completed_at"] = datetime.utcnow().isoformat()
@@ -229,6 +232,39 @@ class TaskManager:
             logger.info(f"清理过期任务: {len(tasks_to_remove)}个")
         
         return len(tasks_to_remove)
+
+
+def _sanitize_for_json(obj: Any) -> Any:
+    """
+    递归地将对象中所有不可 JSON 序列化的类型转换为 Python 原生类型。
+    处理 numpy 数值类型（int64、float64、ndarray 等）和 NaN/Inf。
+    """
+    # numpy 类型处理（不直接 import numpy，避免硬依赖）
+    module_name = type(obj).__module__ or ""
+    if module_name.startswith("numpy"):
+        # numpy 标量 -> Python int / float
+        if hasattr(obj, "item"):
+            obj = obj.item()  # 转换后继续处理（可能是 nan）
+        # numpy ndarray -> list
+        elif hasattr(obj, "tolist"):
+            return [_sanitize_for_json(v) for v in obj.tolist()]
+
+    # 处理 Python float 中的 nan/inf（JSON 不合法）
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+
+    # 兜底：用严格 JSON 检查
+    try:
+        json.dumps(obj, allow_nan=False)
+        return obj
+    except (TypeError, ValueError):
+        return str(obj)
 
 
 # 全局任务管理器实例

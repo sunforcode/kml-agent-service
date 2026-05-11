@@ -135,13 +135,13 @@ class TrajectoryAgent(BaseAgent):
             (content_str, file_type)  file_type: "kml" 或 "gpx"
         """
         # 1. 优先使用直接提供的内容
-        kml_content = request.get("kml_content", "").strip()
+        kml_content = (request.get("kml_content") or "").strip()
         if kml_content:
             file_type = self._infer_file_type_from_content(kml_content)
             return kml_content, file_type
         
         # 2. 从URL下载
-        kml_url = request.get("kml_source", "").strip()
+        kml_url = (request.get("kml_source") or "").strip()
         if not kml_url:
             raise ValueError("未提供 kml_content 或 kml_source")
         

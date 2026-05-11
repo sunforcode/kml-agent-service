@@ -126,15 +126,36 @@ class SegmentationAgent(BaseAgent):
                 if single_segment:
                     segments = [single_segment]
             
-            # 4. 为每个段计算附加信息：难度、估算时间、建议名称
+            # 4. 验证分段覆盖是否完整（调试日志）
+            total_pts = len(points)
+            if segments:
+                covered_start = segments[0].start_index
+                covered_end = segments[-1].end_index
+                coverage_pct = (covered_end - covered_start + 1) / total_pts * 100
+                logger.info(
+                    f"SegmentationAgent: 分段数={len(segments)}, "
+                    f"轨迹总点数={total_pts}, "
+                    f"覆盖范围=[{covered_start}, {covered_end}], "
+                    f"覆盖率={coverage_pct:.1f}%"
+                )
+                if covered_start > 0 or covered_end < total_pts - 1:
+                    logger.warning(
+                        f"SegmentationAgent: 轨迹覆盖不完整！"
+                        f"前段遗漏={covered_start}点, 后段遗漏={total_pts - 1 - covered_end}点"
+                    )
+
+            # 5. 为每个段计算附加信息：难度、估算时间、建议名称
             enriched_segments = []
             for i, seg in enumerate(segments):
                 enriched = self._enrich_segment(seg, points, i, len(segments))
                 enriched_segments.append(enriched)
             
-            # 5. 组装为与原有假数据兼容的格式
-            result = self._assemble_result(enriched_segments)
-            
+            # 6. 计算按天分段（如果有时间戳）
+            day_segments = self._build_day_segments(points)
+
+            # 7. 组装为 v2 格式（segment_schemes）
+            result = self._assemble_result(enriched_segments, day_segments)
+
             self.log_complete(segments_count=len(enriched_segments))
             return result
             
@@ -561,23 +582,142 @@ class SegmentationAgent(BaseAgent):
         
         return name
 
-    def _assemble_result(self, enriched_segments: List[Dict]) -> Dict[str, Any]:
+    def _assemble_result(self, enriched_segments: List[Dict], day_segments: Optional[List[Dict]] = None) -> Dict[str, Any]:
         """
-        组装与原有假数据格式完全一致的结果
+        组装 v2 格式结果：输出 segment_schemes 列表
+
+        包含两个方案：
+        - slope: 按坡度（主方案，已算法实现）
+        - day: 按天（有时间戳时真实实现，无时间戳则为空）
         """
+        schemes = [
+            {
+                "scheme_type": "slope",
+                "label": "按坡度",
+                "is_default": True,
+                "segments": enriched_segments
+            },
+            {
+                "scheme_type": "day",
+                "label": "按天",
+                "is_default": False,
+                "segments": day_segments or []  # 无时间戳时为空列表
+            },
+            {
+                "scheme_type": "terrain",
+                "label": "按地形",
+                "is_default": False,
+                "segments": []  # TODO: 待 find_peaks 算法实现
+            },
+            {
+                "scheme_type": "road_type",
+                "label": "按路况",
+                "is_default": False,
+                "segments": []  # TODO: 待 OSM highway 数据接入
+            }
+        ]
         return {
-            "segments": enriched_segments,
+            "segment_schemes": schemes,
             "current_step": "segmentation",
             "overall_progress": 30
         }
 
+    def _build_day_segments(self, points: List[TrackPoint]) -> List[Dict[str, Any]]:
+        """
+        基于时间间隔计算按天分段列表
+
+        过滤条件：轨迹点必须有时间戳，否则返回空列表。
+        分天逐辑：相邻两点时间间隔 > time_gap_hours 就新开一天。
+        """
+        # 如果没有时间戳，返回空列表
+        has_timestamps = any(p.timestamp is not None for p in points)
+        if not has_timestamps:
+            logger.info("SegmentationAgent: 轨迹无时间戳，按天方案 segments 为空")
+            return []
+
+        # 分天逻辑
+        gap_threshold_seconds = self.time_gap_hours * 3600
+        day_groups: List[List[int]] = [[0]]  # 第一天从第0个点开始
+
+        for i in range(1, len(points)):
+            prev = points[i - 1]
+            curr = points[i]
+            if prev.timestamp and curr.timestamp:
+                diff = (curr.timestamp - prev.timestamp).total_seconds()
+                if diff > gap_threshold_seconds:
+                    day_groups.append([])  # 新开一天
+            day_groups[-1].append(i)
+
+        if len(day_groups) <= 1:
+            # 只有一天，不需要按天分段
+            return []
+
+        # 为每天生成一个 segment
+        day_segment_list = []
+        for day_idx, idx_list in enumerate(day_groups):
+            if not idx_list:
+                continue
+            start_i = idx_list[0]
+            end_i = idx_list[-1]
+            sp = points[start_i]
+            ep = points[end_i]
+
+            # 简单计算距离
+            total_dist = (points[end_i].distance_from_start or 0) - (points[start_i].distance_from_start or 0)
+            total_gain = sum(
+                max(0, points[j].elevation - points[j - 1].elevation)
+                for j in range(start_i + 1, end_i + 1)
+                if points[j].elevation is not None and points[j - 1].elevation is not None
+            )
+            total_loss = sum(
+                max(0, points[j - 1].elevation - points[j].elevation)
+                for j in range(start_i + 1, end_i + 1)
+                if points[j].elevation is not None and points[j - 1].elevation is not None
+            )
+
+            seg_id = f"day_{day_idx + 1:02d}"
+            day_segment_list.append({
+                "id": seg_id,
+                "name": f"第{day_idx + 1}天",
+                "sequence_number": day_idx + 1,
+                "color": "#607D8B",  # 按天统一用灯笼蓝
+                "distance": round(total_dist, 2),
+                "elevation_gain": round(total_gain, 1),
+                "elevation_loss": round(total_loss, 1),
+                "estimated_time": None,
+                "difficulty": None,
+                "track_start_index": start_i,
+                "track_end_index": end_i,
+                "start_point": {
+                    "latitude": sp.latitude,
+                    "longitude": sp.longitude,
+                    "elevation": sp.elevation
+                },
+                "end_point": {
+                    "latitude": ep.latitude,
+                    "longitude": ep.longitude,
+                    "elevation": ep.elevation
+                },
+                "segment_type": "day",
+                "description": None,
+                "notes": None
+            })
+
+        return day_segment_list
+
     def _empty_result(self, message: str) -> Dict[str, Any]:
         """
-        降级：返回空分段 + 警告
+        降级：返回空分段方案 + 警告
         """
         logger.warning(f"SegmentationAgent 降级: {message}")
+        empty_schemes = [
+            {"scheme_type": "slope", "label": "按坡度", "is_default": True, "segments": []},
+            {"scheme_type": "day", "label": "按天", "is_default": False, "segments": []},
+            {"scheme_type": "terrain", "label": "按地形", "is_default": False, "segments": []},
+            {"scheme_type": "road_type", "label": "按路况", "is_default": False, "segments": []},
+        ]
         return {
-            "segments": [],
+            "segment_schemes": empty_schemes,
             "current_step": "segmentation",
             "overall_progress": 30,
             "warnings": [{"level": "warning", "message": message}]

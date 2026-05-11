@@ -28,7 +28,8 @@ class Settings(BaseSettings):
     # LLM 配置
     # ========================================
     openai_api_key: Optional[str] = None
-    openai_model: str = "gpt-4o-mini"
+    openai_base_url: Optional[str] = None
+    openai_model: str = "deepseek-chat"
     openai_temperature: float = 0.7
     openai_max_tokens: int = 4000
 

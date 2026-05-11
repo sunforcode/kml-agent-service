@@ -40,14 +40,48 @@ class AgentState(TypedDict, total=False):
     # ========================================
     # 路径分段结果（路径分段Agent产出）
     # ========================================
-    segments: List[Dict[str, Any]]
-    """路段列表"""
-    
+    segment_schemes: List[Dict[str, Any]]
+    """
+    分段方案列表
+    每条路线可有多套方案，结构为:
+    [
+        {
+            "scheme_type": "slope",
+            "label": "按坡度",
+            "is_default": True,
+            "segments": [...]
+        },
+        {
+            "scheme_type": "day",
+            "label": "按天",
+            "is_default": False,
+            "segments": [...]
+        }
+    ]
+    """
+
     # ========================================
     # POI识别结果（POI识别Agent产出）
     # ========================================
-    pois: List[Dict[str, Any]]
-    """POI列表"""
+    poi_points: List[Dict[str, Any]]
+    """
+    统一附属信息点列表
+    结构为:
+    [
+        {
+            "name": str,
+            "latitude": float,
+            "longitude": float,
+            "elevation": float | None,
+            "category": str,          # water|camp|supply|photo|pass|valley|weather|danger|start|end
+            "sub_category": str | None,
+            "source": str,            # kml_marker|algorithm|osm|weather_api|experience
+            "description": str | None,
+            "confidence": float | None,
+            "card_data": dict | None
+        }
+    ]
+    """
     
     # ========================================
     # 内容生成结果（内容生成Agent产出）

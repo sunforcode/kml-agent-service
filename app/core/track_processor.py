@@ -144,51 +144,68 @@ class TrackProcessor:
             #     ...
             
         elif file_type.lower() == "kml":
-            # KML 解析稍微复杂，用 fastkml 或 minidom
-            # 这里简单实现，实际项目可以用 fastkml
             from xml.etree import ElementTree as ET
-            
+
             # 命名空间处理
-            ns = {"kml": "http://www.opengis.net/kml/2.2"}
-            
+            ns = {
+                "kml": "http://www.opengis.net/kml/2.2",
+                "gx": "http://www.google.com/kml/ext/2.2",
+            }
+
             root = ET.fromstring(content)
-            
-            # 查找 LineString 或 coordinates
-            coordinates_elems = root.findall(".//kml:coordinates", ns)
-            
+
             cumulative_distance = 0.0
             prev_lat_lon = None
-            
-            for coords_elem in coordinates_elems:
-                if coords_elem.text:
-                    coord_text = coords_elem.text.strip()
-                    coord_lines = coord_text.split()
-                    
-                    for line in coord_lines:
-                        parts = line.split(",")
+
+            def _append_point(lat, lon, elev):
+                nonlocal cumulative_distance, prev_lat_lon
+                if prev_lat_lon:
+                    cumulative_distance += geodesic(prev_lat_lon, (lat, lon)).km
+                points.append(TrackPoint(
+                    latitude=lat,
+                    longitude=lon,
+                    elevation=elev,
+                    distance_from_start=cumulative_distance,
+                ))
+                prev_lat_lon = (lat, lon)
+
+            # 方案 1： gx:Track / gx:MultiTrack （两步路、奥维等 App 导出格式）
+            # 每个点是单独的 <gx:coord>lng lat elev</gx:coord>
+            gx_coords = root.findall(".//gx:coord", ns)
+            if gx_coords:
+                for elem in gx_coords:
+                    if elem.text:
+                        parts = elem.text.strip().split()
                         if len(parts) >= 2:
                             try:
                                 lon = float(parts[0])
                                 lat = float(parts[1])
                                 elev = float(parts[2]) if len(parts) > 2 else None
-                                
-                                if prev_lat_lon:
-                                    cumulative_distance += geodesic(
-                                        prev_lat_lon, (lat, lon)
-                                    ).km
-                                
-                                point = TrackPoint(
-                                    latitude=lat,
-                                    longitude=lon,
-                                    elevation=elev,
-                                    distance_from_start=cumulative_distance
-                                )
-                                points.append(point)
-                                prev_lat_lon = (lat, lon)
-                                
+                                _append_point(lat, lon, elev)
                             except (ValueError, IndexError):
                                 continue
-        
+
+            # 方案 2： 普通 LineString / MultiGeometry 中的 <coordinates>
+            # 格式： lng,lat,elev (逗号分隔，多个点用空白分隔)
+            if not points:
+                for coords_elem in root.findall(".//kml:coordinates", ns):
+                    if coords_elem.text:
+                        # 过滤出单点 Placemark （包含换行），只保留多点线段
+                        coord_text = coords_elem.text.strip()
+                        coord_lines = [l for l in coord_text.split() if "," in l]
+                        if len(coord_lines) < 2:
+                            continue  # 单点 Placemark，跳过
+                        for line in coord_lines:
+                            parts = line.split(",")
+                            if len(parts) >= 2:
+                                try:
+                                    lon = float(parts[0])
+                                    lat = float(parts[1])
+                                    elev = float(parts[2]) if len(parts) > 2 else None
+                                    _append_point(lat, lon, elev)
+                                except (ValueError, IndexError):
+                                    continue
+
         return points
 
     # ============================================
@@ -414,70 +431,62 @@ class TrackProcessor:
         slopes: Optional[List[float]] = None
     ) -> List[TrackSegment]:
         """
-        按坡度趋势分段（上升/下降/平坦）
+        基于高程极值点分段（上升/下降/平坦）
         
         原理：
-        1. 坡度连续为正 -> 爬升段
-        2. 坡度连续为负 -> 下降段
-        3. 坡度接近0 -> 平坦段
+        用 scipy.signal.find_peaks 找高程曲线的极大值（山顶/垭口）和极小值（谷底），
+        这些极值点天然是爬升/下降的转折边界。两个相邻极值点之间即为一段，
+        段类型由区间内高程净变化量决定。
         
-        使用 numpy 的信号处理能力
+        优点：
+        - 不依赖逐点坡度标签，避免局部抖动导致碎片化
+        - 所有点都被覆盖，不存在点丢失
+        - 直接使用 scipy 成熟实现，无需手写合并逻辑
         """
         if not points or len(points) < self.min_segment_points:
             return []
-        
-        # 计算坡度
+
+        # 1. 提取高程数组并平滑（消除 GPS 噪声对极值检测的干扰）
+        elevations = np.array([p.elevation for p in points], dtype=float)
+        n = len(elevations)
+        window = min(21, (n // 4) * 2 + 1)
+        window = max(window, 5)
+        if n >= window:
+            smooth_elev = signal.savgol_filter(elevations, window_length=window, polyorder=2)
+        else:
+            smooth_elev = elevations.copy()
+
+        # 2. 用 find_peaks 找极大值和极小值
+        #    prominence: 极值相对周围的「显著高度」，过滤掉小于 30m 的起伏
+        #    distance:   两个极值之间的最小点数间距，避免极值扎堆
+        min_dist_points = max(5, n // 50)
+        peaks_max, _ = signal.find_peaks(smooth_elev, prominence=30.0, distance=min_dist_points)
+        peaks_min, _ = signal.find_peaks(-smooth_elev, prominence=30.0, distance=min_dist_points)
+
+        # 3. 合并极大/极小值索引，加上首尾，排序后得到分段边界
+        boundary_indices = np.unique(
+            np.concatenate([[0], peaks_max, peaks_min, [n - 1]])
+        )
+
+        # 4. 计算坡度（供 _create_segment 使用）
         if slopes is None:
             slopes = self.calculate_slopes(points)
-        
-        if len(slopes) != len(points):
-            return []
-        
-        slopes_array = np.array(slopes)
-        
-        # 标注每个点的趋势类型
-        # 0=平坦, 1=爬升, -1=下降
-        trend_labels = np.zeros(len(slopes_array), dtype=int)
-        
-        # 爬升
-        trend_labels[slopes_array > self.climb_slope_threshold] = 1
-        # 下降
-        trend_labels[slopes_array < -self.climb_slope_threshold] = -1
-        # 中间的是平坦（在 flat 阈值内）
-        
-        # 找变化点（使用 numpy 的差分）
-        changes = np.where(np.diff(trend_labels) != 0)[0] + 1
-        
-        # 构建分段边界
-        boundaries = np.concatenate([[0], changes, [len(points)]])
-        
+        slopes_array = np.array(slopes) if slopes else np.zeros(n)
+
+        # 5. 按边界构建分段，每段类型由高程净变化量决定
         segments = []
-        
-        for i in range(len(boundaries) - 1):
-            start_idx = boundaries[i]
-            end_idx = boundaries[i + 1] - 1
-            
-            # 过滤过短的分段
-            if (end_idx - start_idx + 1) < self.min_segment_points:
-                continue
-            
-            seg_points = points[start_idx:end_idx+1]
-            seg_dist = (
-                seg_points[-1].distance_from_start - 
-                seg_points[0].distance_from_start
-            )
-            
-            if seg_dist < self.min_segment_distance_km:
-                continue
-            
+        for i in range(len(boundary_indices) - 1):
+            start_idx = int(boundary_indices[i])
+            end_idx = int(boundary_indices[i + 1])
             seg = self._create_segment(points, start_idx, end_idx, slopes_array)
             if seg:
                 segments.append(seg)
-        
-        # 后处理：合并相邻的相同类型短分段
-        segments = self._merge_adjacent_similar_segments(segments)
-        
-        return segments
+
+        if not segments:
+            return []
+
+        # 6. 合并相邻同类型段（消除连续同向碎片）
+        return self._merge_adjacent_similar_segments(segments)
 
     def _create_segment(
         self,
@@ -508,16 +517,21 @@ class TrackProcessor:
         
         sub_slopes = slopes_array[start_idx:end_idx+1] if len(slopes_array) > end_idx else np.array([])
         
-        avg_slope = float(np.mean(sub_slopes)) if len(sub_slopes) else 0.0
-        max_slope = float(np.max(np.abs(sub_slopes))) if len(sub_slopes) else 0.0
+        # 过滤 nan 后计算坡度统计
+        valid_slopes = sub_slopes[~np.isnan(sub_slopes)] if len(sub_slopes) else np.array([])
+        avg_slope = float(np.mean(valid_slopes)) if len(valid_slopes) else 0.0
+        max_slope = float(np.max(np.abs(valid_slopes))) if len(valid_slopes) else 0.0
         
-        # 判断类型
-        if abs(avg_slope) < self.flat_slope_threshold:
+        # 判断类型：优先用高程净变化量（不受坡度 nan 影响）
+        net_elev_change = sub_points[-1].elevation - sub_points[0].elevation
+        elev_range = elev_stats.total_gain_m + elev_stats.total_loss_m  # 总振幅
+        # 净变化 / 总振幅 > 0.5 视为单向爬升或下降，否则为混合
+        if elev_range < 10:  # 高差极小，平坦段
             seg_type = SegmentType.FLAT
-        elif avg_slope > self.climb_slope_threshold:
-            seg_type = SegmentType.CLIMB
-        elif avg_slope < -self.climb_slope_threshold:
-            seg_type = SegmentType.DESCENT
+        elif elev_range > 0 and abs(net_elev_change) / elev_range > 0.5:
+            seg_type = SegmentType.CLIMB if net_elev_change > 0 else SegmentType.DESCENT
+        elif abs(avg_slope) < self.flat_slope_threshold:
+            seg_type = SegmentType.FLAT
         else:
             seg_type = SegmentType.MIXED
         
@@ -538,7 +552,13 @@ class TrackProcessor:
         self, 
         segments: List[TrackSegment]
     ) -> List[TrackSegment]:
-        """合并相邻的相同类型的短分段"""
+        """
+        合并相邻的相同类型分段。
+        
+        改进：
+        - 同类型且相邻的段无论长短都合并（消除连续同向的碎片）
+        - 不同类型且都很短（< 1km）的段也合并（避免极短的「切换段」）
+        """
         if len(segments) < 2:
             return segments
         
@@ -546,25 +566,28 @@ class TrackProcessor:
         current = segments[0]
         
         for seg in segments[1:]:
-            # 如果类型相同且都比较短，合并
-            if (
-                seg.segment_type == current.segment_type and
-                (current.distance_km < 1.0 or seg.distance_km < 1.0)
-            ):
-                # 合并成新的分段
-                # 这里简化处理，实际可以重新计算统计
+            same_type = seg.segment_type == current.segment_type
+            both_short = current.distance_km < 1.0 and seg.distance_km < 1.0
+            
+            if same_type or both_short:
+                # 合并：重新计算统计，保证准确
+                new_dist = current.distance_km + seg.distance_km
+                if new_dist > 0:
+                    new_avg_slope = round(
+                        (current.avg_slope_degrees * current.distance_km +
+                         seg.avg_slope_degrees * seg.distance_km) / new_dist, 2
+                    )
+                else:
+                    new_avg_slope = 0.0
+                
                 current = TrackSegment(
                     start_index=current.start_index,
                     end_index=seg.end_index,
-                    segment_type=current.segment_type,
-                    distance_km=round(current.distance_km + seg.distance_km, 2),
-                    elevation_gain_m=current.elevation_gain_m + seg.elevation_gain_m,
-                    elevation_loss_m=current.elevation_loss_m + seg.elevation_loss_m,
-                    avg_slope_degrees=round(
-                        (current.avg_slope_degrees * current.distance_km + 
-                         seg.avg_slope_degrees * seg.distance_km) /
-                        (current.distance_km + seg.distance_km), 2
-                    ),
+                    segment_type=current.segment_type if same_type else SegmentType.MIXED,
+                    distance_km=round(new_dist, 2),
+                    elevation_gain_m=round(current.elevation_gain_m + seg.elevation_gain_m, 1),
+                    elevation_loss_m=round(current.elevation_loss_m + seg.elevation_loss_m, 1),
+                    avg_slope_degrees=new_avg_slope,
                     max_slope_degrees=max(current.max_slope_degrees, seg.max_slope_degrees),
                     start_point=current.start_point,
                     end_point=seg.end_point
@@ -637,11 +660,11 @@ class TrackProcessor:
 def create_default_processor() -> TrackProcessor:
     """创建使用默认配置的处理器"""
     return TrackProcessor({
-        "smooth_window": 7,
+        "smooth_window": 21,        # 增大平滑窗口，减少坡度噪声
         "smooth_polyorder": 3,
         "elevation_threshold_m": 3.0,
         "flat_slope_threshold": 3.0,
         "climb_slope_threshold": 5.0,
         "min_segment_points": 10,
-        "min_segment_distance_km": 0.3
+        "min_segment_distance_km": 0.5  # 最小分段距离提高到0.5km，减少碎片
     })
