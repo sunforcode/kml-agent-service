@@ -1,0 +1,51 @@
+name: Deploy kml-agent
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy kml-agent to walk-server
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout kml-agent-service
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Trust server host key
+        env:
+          WALK_SERVER: ${{ secrets.WALK_SERVER }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${WALK_SERVER##*@}" >> ~/.ssh/known_hosts
+
+      - name: Sync code to server
+        env:
+          WALK_SERVER: ${{ secrets.WALK_SERVER }}
+          WALK_REMOTE_DIR: ${{ secrets.WALK_REMOTE_DIR }}
+        run: |
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude '.venv' \
+            --exclude '__pycache__' \
+            --exclude '*.log' \
+            --exclude 'logs' \
+            . \
+            "$WALK_SERVER:$WALK_REMOTE_DIR/kml-agent-service/"
+
+      - name: Build and restart kml-agent
+        env:
+          WALK_SERVER: ${{ secrets.WALK_SERVER }}
+          WALK_REMOTE_DIR: ${{ secrets.WALK_REMOTE_DIR }}
+        run: |
+          ssh "$WALK_SERVER" "cd $WALK_REMOTE_DIR/deploy && docker compose build kml-agent"
+          ssh "$WALK_SERVER" "cd $WALK_REMOTE_DIR/deploy && docker compose up -d kml-agent"
