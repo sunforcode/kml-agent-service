@@ -7,12 +7,14 @@ WalkBG 回调服务
 3. 记录回调日志
 """
 
+import asyncio
 import logging
 import httpx
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 from app.core.config import settings
+from app.models.response import EnhancedRouteOutput
 from app.services.task_service import _sanitize_for_json
 
 logger = logging.getLogger(__name__)
@@ -30,12 +32,14 @@ class CallbackService:
         self.callback_endpoint = settings.walkbg_callback_endpoint
         self.timeout = settings.walkbg_api_timeout
         self.enabled = settings.walkbg_callback_enabled
-        
+        self.max_attempts = settings.walkbg_callback_max_attempts
+        self.retry_base_delay = settings.walkbg_callback_retry_base_delay
+
         self.full_callback_url = f"{self.base_url}{self.callback_endpoint}"
-        
+
         logger.info(
             f"回调服务初始化: enabled={self.enabled}, "
-            f"url={self.full_callback_url}"
+            f"url={self.full_callback_url}, max_attempts={self.max_attempts}"
         )
     
     async def send_callback(
@@ -66,7 +70,47 @@ class CallbackService:
         )
         
         logger.info(f"发送回调到 WalkBG: task_id={task_id}, url={self.full_callback_url}")
-        
+
+        # 分析结果是经过数分钟 LLM 计算得出的，且仅保存在本进程内存中，
+        # 一次网络抖动就永久丢失代价过高，因此对可重试的失败做指数退避重试。
+        last_error = "unknown"
+        for attempt in range(1, self.max_attempts + 1):
+            should_retry, last_error = await self._attempt_callback(
+                task_id, callback_payload, attempt
+            )
+            if should_retry is None:
+                return True
+            if not should_retry:
+                # 客户端错误（4xx）重试不会改变结果，直接放弃
+                break
+            if attempt < self.max_attempts:
+                # 退避时长：base * 2^(attempt-1)，例如 2s / 4s / 8s
+                delay = self.retry_base_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    f"回调失败，{delay}s 后重试: task_id={task_id}, "
+                    f"attempt={attempt}/{self.max_attempts}, error={last_error}"
+                )
+                await asyncio.sleep(delay)
+
+        logger.error(
+            f"回调最终失败，分析结果未能送达 WalkBG: task_id={task_id}, "
+            f"attempts={self.max_attempts}, last_error={last_error}"
+        )
+        return False
+
+    async def _attempt_callback(
+        self,
+        task_id: str,
+        callback_payload: Dict[str, Any],
+        attempt: int
+    ) -> tuple[Optional[bool], str]:
+        """
+        尝试一次回调。
+
+        Returns:
+            (should_retry, error_message)
+            should_retry 为 None 表示成功；True 表示可重试；False 表示不应重试。
+        """
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
@@ -74,26 +118,37 @@ class CallbackService:
                     json=callback_payload,
                     headers={"Content-Type": "application/json"}
                 )
-                
-                if response.status_code in [200, 201, 202]:
-                    logger.info(f"回调成功: task_id={task_id}, status_code={response.status_code}")
-                    return True
-                else:
-                    logger.warning(
-                        f"回调返回非成功状态: task_id={task_id}, "
-                        f"status_code={response.status_code}, response={response.text}"
-                    )
-                    return False
-                    
+
+            if response.status_code in [200, 201, 202]:
+                logger.info(
+                    f"回调成功: task_id={task_id}, "
+                    f"status_code={response.status_code}, attempt={attempt}"
+                )
+                return None, ""
+
+            error = f"HTTP {response.status_code}: {response.text[:200]}"
+            # 4xx 表示请求本身不被接受，重发相同内容仍会失败；
+            # 5xx 与其他状态可能是服务端临时问题，值得重试。
+            if 400 <= response.status_code < 500:
+                logger.error(
+                    f"回调被拒绝（不重试）: task_id={task_id}, {error}"
+                )
+                return False, error
+            return True, error
+
         except httpx.TimeoutException:
-            logger.error(f"回调超时: task_id={task_id}")
-            return False
+            return True, "timeout"
         except httpx.ConnectError as e:
-            logger.error(f"回调连接失败: task_id={task_id}, error={str(e)}")
-            return False
+            return True, f"connect_error: {str(e)}"
+        except httpx.HTTPError as e:
+            return True, f"http_error: {str(e)}"
         except Exception as e:
-            logger.error(f"回调失败: task_id={task_id}, error={str(e)}", exc_info=True)
-            return False
+            # 非网络异常（如序列化问题）重试无意义
+            logger.error(
+                f"回调出现非网络异常（不重试）: task_id={task_id}, error={str(e)}",
+                exc_info=True
+            )
+            return False, str(e)
     
     def _build_callback_payload(
         self,
@@ -102,13 +157,17 @@ class CallbackService:
         result: Dict[str, Any],
         status: str
     ) -> Dict[str, Any]:
-        """构建回调请求体"""
+        """构建回调请求体；成功结果必须满足最终输出契约。"""
+        if status == "completed":
+            result = EnhancedRouteOutput.model_validate(result).model_dump(mode="json")
+
         segment_schemes = self._convert_segment_schemes(result.get("segment_schemes", []))
         poi_points = self._convert_poi_points(result.get("poi_points", []))
 
         payload = {
             "task_id": task_id,
             "route_id": route_id,
+            "status": status,
             "source_kml_url": result.get("source_kml_url"),
             "analysis_timestamp": result.get("analysis_timestamp") or datetime.utcnow().isoformat(),
             "quality_score": result.get("quality_score"),
@@ -167,18 +226,19 @@ class CallbackService:
         """转换 segments 为 CallbackSegmentDto 格式"""
         converted = []
         
-        for i, seg in enumerate(segments):
+        for seg in segments:
             converted_seg = {
-                "id": seg.get("id") or f"seg_{i}",
-                "name": seg.get("name") or f"路段{i+1}",
-                "sequence_number": i + 1,
-                "color": seg.get("color") or self._get_segment_color(i),
+                "id": seg["id"],
+                "name": seg["name"],
+                "sequence_number": int(seg["sequence_number"]),
+                "color": seg["color"],
                 "description": seg.get("description"),
                 "distance": float(seg.get("distance", 0)),
                 "elevation_gain": float(seg.get("elevation_gain", 0)),
                 "elevation_loss": float(seg.get("elevation_loss", 0)),
                 "estimated_time": int(seg.get("estimated_time", 0)),
                 "difficulty": int(seg.get("difficulty", 2)),
+                "scheme_type": seg.get("scheme_type", "slope"),
                 "track_start_index": seg.get("track_start_index"),
                 "track_end_index": seg.get("track_end_index"),
                 "segment_type": seg.get("segment_type"),

@@ -80,23 +80,31 @@ async def lifespan(app: FastAPI):
 
 
 # 创建FastAPI应用
+# 文档端点是否开启由配置控制：本服务不对外提供公开 API，
+# 生产环境暴露 /docs 等于公开内部接口与数据结构。
 app = FastAPI(
     title="KML Agent Service",
     description="KML智能分析服务 - 使用AI Agent分析徒步路线数据",
     version=settings.service_version,
     lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc"
+    docs_url="/docs" if settings.enable_api_docs else None,
+    redoc_url="/redoc" if settings.enable_api_docs else None,
+    openapi_url="/openapi.json" if settings.enable_api_docs else None,
 )
 
 # 配置CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 后续可配置为具体域名
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 本服务的调用方是 walkbg 后端（服务端到服务端，不受 CORS 约束），
+# 因此默认不开放任何浏览器跨域来源。仅在确实需要时通过
+# CORS_ALLOWED_ORIGINS 显式配置。
+_cors_origins = settings.cors_origins_list()
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 # ========================================
@@ -295,18 +303,37 @@ async def execute_analysis_async(task_id: str, request_dict: Dict[str, Any]):
         )
         
         if workflow:
-            result = await workflow.execute_workflow(request_dict)
-            
-            task_manager.set_task_result(task_id, result)
-            
-            logger.info(f"任务完成: {task_id}")
-            
-            await callback_service.send_callback(
+            async def report_progress(step: str, progress: int) -> None:
+                task_manager.update_task_status(
+                    task_id,
+                    TaskStatus.PROCESSING,
+                    progress=progress,
+                    current_step=step,
+                    message=f"已完成步骤: {step}",
+                )
+
+            result = await workflow.execute_workflow(
+                request_dict,
+                progress_callback=report_progress,
+            )
+
+            # 回调是分析结果落库的唯一途径，结果必须检查：
+            # 回调失败意味着 walkbg 侧永远看不到本次分析结果。
+            delivered = await callback_service.send_callback(
                 task_id=task_id,
                 route_id=route_id,
                 result=result,
                 status="completed"
             )
+            if not delivered:
+                error_message = "分析完成但结果回调未送达 WalkBG"
+                logger.error(
+                    f"任务分析成功但回调未送达: task_id={task_id}, route_id={route_id}"
+                )
+                task_manager.set_task_error(task_id, error_message)
+            else:
+                task_manager.set_task_result(task_id, result)
+                logger.info(f"任务完成: {task_id}")
         else:
             raise Exception("分析工作流未初始化")
             
@@ -318,12 +345,18 @@ async def execute_analysis_async(task_id: str, request_dict: Dict[str, Any]):
             "error": str(e),
             "warnings": [{"level": "error", "message": str(e)}]
         }
-        await callback_service.send_callback(
+        delivered = await callback_service.send_callback(
             task_id=task_id,
             route_id=route_id,
             result=error_result,
             status="failed"
         )
+        if not delivered:
+            # 失败通知也没送到，walkbg 侧任务会一直停在处理中状态
+            logger.error(
+                f"任务失败且失败回调未送达，walkbg 侧可能残留处理中状态: "
+                f"task_id={task_id}, route_id={route_id}"
+            )
 
 
 # ========================================

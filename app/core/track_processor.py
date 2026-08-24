@@ -45,6 +45,7 @@ class TrackPoint:
     timestamp: Optional[datetime] = None
     distance_from_start: float = 0.0
     slope_degrees: float = 0.0
+    segment_index: int = 0
 
 
 @dataclass
@@ -114,14 +115,15 @@ class TrackProcessor:
         
         if file_type.lower() == "gpx":
             gpx = gpxpy.parse(content)
+            cumulative_distance = 0.0
             
-            # gpxpy 已经帮我们处理了 tracks, segments
+            # 全局距离跨 segment 累计，但 segment 首点不连接上一段末点。
+            segment_index = 0
             for track in gpx.tracks:
                 for segment in track.segments:
-                    cumulative_distance = 0.0
                     prev_point = None
                     
-                    for i, p in enumerate(segment.points):
+                    for p in segment.points:
                         if prev_point:
                             # geopy 计算距离（比自己实现更准确）
                             cumulative_distance += geodesic(
@@ -134,10 +136,12 @@ class TrackProcessor:
                             longitude=p.longitude,
                             elevation=p.elevation,
                             timestamp=p.time,
-                            distance_from_start=cumulative_distance
+                            distance_from_start=cumulative_distance,
+                            segment_index=segment_index,
                         )
                         points.append(point)
                         prev_point = p
+                    segment_index += 1
             
             # 还可以提取 waypoints
             # for wp in gpx.waypoints:
@@ -157,7 +161,7 @@ class TrackProcessor:
             cumulative_distance = 0.0
             prev_lat_lon = None
 
-            def _append_point(lat, lon, elev):
+            def _append_point(lat, lon, elev, segment_index):
                 nonlocal cumulative_distance, prev_lat_lon
                 if prev_lat_lon:
                     cumulative_distance += geodesic(prev_lat_lon, (lat, lon)).km
@@ -166,30 +170,36 @@ class TrackProcessor:
                     longitude=lon,
                     elevation=elev,
                     distance_from_start=cumulative_distance,
+                    segment_index=segment_index,
                 ))
                 prev_lat_lon = (lat, lon)
 
             # 方案 1： gx:Track / gx:MultiTrack （两步路、奥维等 App 导出格式）
-            # 每个点是单独的 <gx:coord>lng lat elev</gx:coord>
-            gx_coords = root.findall(".//gx:coord", ns)
-            if gx_coords:
-                for elem in gx_coords:
-                    if elem.text:
-                        parts = elem.text.strip().split()
-                        if len(parts) >= 2:
-                            try:
-                                lon = float(parts[0])
-                                lat = float(parts[1])
-                                elev = float(parts[2]) if len(parts) > 2 else None
-                                _append_point(lat, lon, elev)
-                            except (ValueError, IndexError):
-                                continue
+            # 每条 gx:Track 是独立线段，首点不连接上一条 track 的末点。
+            gx_tracks = root.findall(".//gx:Track", ns)
+            if gx_tracks:
+                for segment_index, track in enumerate(gx_tracks):
+                    prev_lat_lon = None
+                    for elem in track.findall("gx:coord", ns):
+                        if elem.text:
+                            parts = elem.text.strip().split()
+                            if len(parts) >= 2:
+                                try:
+                                    lon = float(parts[0])
+                                    lat = float(parts[1])
+                                    elev = float(parts[2]) if len(parts) > 2 else None
+                                    _append_point(lat, lon, elev, segment_index)
+                                except (ValueError, IndexError):
+                                    continue
 
             # 方案 2： 普通 LineString / MultiGeometry 中的 <coordinates>
             # 格式： lng,lat,elev (逗号分隔，多个点用空白分隔)
             if not points:
+                segment_index = 0
                 for coords_elem in root.findall(".//kml:coordinates", ns):
                     if coords_elem.text:
+                        # 每个 coordinates 元素是独立线段，不连接上一条线的末点。
+                        prev_lat_lon = None
                         # 过滤出单点 Placemark （包含换行），只保留多点线段
                         coord_text = coords_elem.text.strip()
                         coord_lines = [l for l in coord_text.split() if "," in l]
@@ -202,9 +212,10 @@ class TrackProcessor:
                                     lon = float(parts[0])
                                     lat = float(parts[1])
                                     elev = float(parts[2]) if len(parts) > 2 else None
-                                    _append_point(lat, lon, elev)
+                                    _append_point(lat, lon, elev, segment_index)
                                 except (ValueError, IndexError):
                                     continue
+                        segment_index += 1
 
         return points
 
@@ -281,46 +292,46 @@ class TrackProcessor:
         if not points or len(points) < 2:
             return ElevationStats(0, 0, 0, 0, 0)
         
-        # 提取高程
-        elevations = [p.elevation for p in points if p.elevation is not None]
-        if not elevations:
+        # 每个文件原始 segment 独立平滑和求差，避免跨边界计算高差。
+        segment_elevations: List[List[float]] = []
+        current_segment_index = None
+        for point in points:
+            if point.segment_index != current_segment_index:
+                segment_elevations.append([])
+                current_segment_index = point.segment_index
+            if point.elevation is not None:
+                segment_elevations[-1].append(point.elevation)
+
+        segment_elevations = [values for values in segment_elevations if values]
+        if not segment_elevations:
             return ElevationStats(0, 0, 0, 0, 0)
-        
-        # 1. 平滑处理（scipy）
-        smoothed = self.smooth_elevation(elevations)
-        
-        # 2. 计算差分
-        diffs = np.diff(smoothed)
-        
-        # 3. 阈值过滤（蓄水池算法）
-        # 参考 GPS Visualizer 和 Strava 的做法
+
+        smoothed_segments = [self.smooth_elevation(values) for values in segment_elevations]
+
+        # 阈值过滤（蓄水池算法）在每个 segment 边界重置。
         total_gain = 0.0
         total_loss = 0.0
-        
-        pending_gain = 0.0
-        pending_loss = 0.0
-        
-        for d in diffs:
-            if d > 0:
-                pending_gain += d
-                pending_loss = 0.0
-                
-                # 超过阈值才计入
-                if pending_gain >= self.elevation_threshold_m:
-                    total_gain += pending_gain
-                    pending_gain = 0.0
-            elif d < 0:
-                pending_loss += abs(d)
-                pending_gain = 0.0
-                
-                if pending_loss >= self.elevation_threshold_m:
-                    total_loss += pending_loss
+        for smoothed in smoothed_segments:
+            pending_gain = 0.0
+            pending_loss = 0.0
+            for d in np.diff(smoothed):
+                if d > 0:
+                    pending_gain += d
                     pending_loss = 0.0
-        
-        # 极值计算
-        max_elev = float(np.max(smoothed))
-        min_elev = float(np.min(smoothed))
-        avg_elev = float(np.mean(smoothed))
+                    if pending_gain >= self.elevation_threshold_m:
+                        total_gain += pending_gain
+                        pending_gain = 0.0
+                elif d < 0:
+                    pending_loss += abs(d)
+                    pending_gain = 0.0
+                    if pending_loss >= self.elevation_threshold_m:
+                        total_loss += pending_loss
+                        pending_loss = 0.0
+
+        all_smoothed = np.concatenate(smoothed_segments)
+        max_elev = float(np.max(all_smoothed))
+        min_elev = float(np.min(all_smoothed))
+        avg_elev = float(np.mean(all_smoothed))
         
         return ElevationStats(
             total_gain_m=round(total_gain, 1),

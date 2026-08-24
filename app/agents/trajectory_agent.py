@@ -88,8 +88,8 @@ class TrajectoryAgent(BaseAgent):
                 file_type=file_type
             )
             
-            if not track_points:
-                return self._fallback_result("未解析到有效轨迹点")
+            if len(track_points) < 2:
+                return self._fatal_result("有效轨迹点少于 2 个")
             
             # 3. 计算统计数据
             #  - 距离：geopy.geodesic（已在解析时计算）
@@ -117,7 +117,7 @@ class TrajectoryAgent(BaseAgent):
             
         except Exception as e:
             self.log_error(e)
-            return self._fallback_result(f"轨迹分析失败: {str(e)}")
+            return self._fatal_result(f"轨迹下载或解析失败: {str(e)}")
 
     async def _get_kml_content(
         self, 
@@ -218,7 +218,7 @@ class TrajectoryAgent(BaseAgent):
                         try:
                             name_elem = pm.find("kml:name", ns)
                             desc_elem = pm.find("kml:description", ns)
-                            coord_elem = pm.find(".//kml:coordinates", ns)
+                            coord_elem = pm.find("kml:Point/kml:coordinates", ns)
                             
                             name = name_elem.text.strip() if name_elem is not None and name_elem.text else ""
                             desc = desc_elem.text.strip() if desc_elem is not None and desc_elem.text else ""
@@ -378,6 +378,7 @@ class TrajectoryAgent(BaseAgent):
                 "elevation": p.elevation,
                 "sequence": i,
                 "distance_from_start": p.distance_from_start * 1000,  # 转米
+                "segment_index": p.segment_index,
             }
             if p.timestamp:
                 pdict["timestamp"] = p.timestamp.isoformat()
@@ -406,29 +407,13 @@ class TrajectoryAgent(BaseAgent):
         
         return result
 
-    def _fallback_result(self, message: str) -> Dict[str, Any]:
-        """
-        降级返回（保持与旧版兼容）
-        如果解析失败，记录警告并返回最小可用结构
-        """
-        import warnings
-        warnings.warn(f"TrajectoryAgent 降级模式: {message}")
-        
+    def _fatal_result(self, message: str) -> Dict[str, Any]:
+        """返回会终止工作流的标准轨迹错误。"""
         return {
             "track_points": [],
             "kml_markers": [],
-            "basic_stats": {
-                "total_distance_km": 0.0,
-                "total_gain_m": 0.0,
-                "total_loss_m": 0.0,
-                "max_elevation": 0.0,
-                "min_elevation": 0.0,
-                "avg_elevation": 0.0,
-                "is_loop": False,
-                "multi_day_signals": False,
-                "data_quality_score": 0.0
-            },
-            "current_step": "trajectory_analysis",
+            "basic_stats": None,
+            "current_step": "trajectory_analysis_failed",
             "overall_progress": 15,
-            "warnings": [{"level": "warning", "message": message}]
+            "errors": [f"FATAL: {message}"],
         }

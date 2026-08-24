@@ -107,24 +107,15 @@ class SegmentationAgent(BaseAgent):
             # 2. 将 dict 转换回 TrackPoint 对象
             points = self._dicts_to_track_points(track_points_dicts)
             
-            if len(points) < self.min_segment_points:
-                return self._empty_result("轨迹点过少，无法分段")
-            
-            # 3. 执行分段（核心逻辑在 track_processor）
-            #    track_processor 内部封装了:
-            #    - numpy.gradient 计算坡度
-            #    - scipy.signal 平滑
-            #    - 阈值分段 + 后处理
-            segments = self.processor.segment(
-                points,
-                strategy=strategy.value
-            )
-            
-            if not segments:
-                # 如果无法分段，退化为单个段
-                single_segment = self._create_single_fallback_segment(points)
-                if single_segment:
-                    segments = [single_segment]
+            if len(points) < 2:
+                return self._fatal_result("没有可分析的连续轨迹段：有效轨迹点不足 2 个")
+
+            # 3. 每个原始轨迹段独立分段，禁止坡度、距离和高程计算跨越
+            #    GPX trkseg / KML LineString 边界。短但连续的单段仍保留单段兜底。
+            segments = self._build_slope_segments(points, strategy)
+            walkable_distance_km = self._calculate_walkable_distance(points)
+            if not segments or walkable_distance_km <= 0:
+                return self._fatal_result("没有可分析的连续轨迹段或可行走距离为 0")
             
             # 4. 验证分段覆盖是否完整（调试日志）
             total_pts = len(points)
@@ -237,29 +228,69 @@ class SegmentationAgent(BaseAgent):
                 except Exception:
                     pass
             
-            dist_m = d.get("distance_from_start", 0.0)
-            # 统一单位：track_processor 内部用 km
-            distance_km = dist_m / 1000.0 if dist_m > 100 else dist_m
+            # AgentState 统一使用米，track_processor 内部使用公里。
+            distance_km = d.get("distance_from_start", 0.0) / 1000.0
             
             point = TrackPoint(
                 latitude=lat,
                 longitude=lon,
                 elevation=elev,
                 timestamp=timestamp,
-                distance_from_start=distance_km
+                distance_from_start=distance_km,
+                segment_index=d.get("segment_index", 0),
             )
             points.append(point)
         
         return points
 
+    def _build_slope_segments(
+        self,
+        points: List[TrackPoint],
+        strategy: SegmentationStrategy,
+    ) -> List[Any]:
+        """按连续的原始轨迹段独立分段，并将局部索引还原为全局索引。"""
+        source_groups: List[tuple[int, List[TrackPoint]]] = []
+        group_start = 0
+        for index in range(1, len(points) + 1):
+            if index == len(points) or points[index].segment_index != points[group_start].segment_index:
+                source_groups.append((group_start, points[group_start:index]))
+                group_start = index
+
+        segments = []
+        for global_start, source_points in source_groups:
+            if len(source_points) < 2:
+                continue
+            if len(source_points) < self.min_segment_points:
+                source_segments = [self._create_single_fallback_segment(source_points)]
+            else:
+                source_segments = self.processor.segment(source_points, strategy=strategy.value)
+                if not source_segments:
+                    source_segments = [self._create_single_fallback_segment(source_points)]
+
+            for segment in source_segments:
+                if segment is None:
+                    continue
+                segment.start_index += global_start
+                segment.end_index += global_start
+                segments.append(segment)
+        return segments
+
+    @staticmethod
+    def _calculate_walkable_distance(points: List[TrackPoint]) -> float:
+        """汇总原始连续段内的未取整距离，不连接相邻原始段。"""
+        total_distance = 0.0
+        for previous, current in zip(points, points[1:]):
+            if current.segment_index == previous.segment_index:
+                total_distance += max(
+                    0.0,
+                    current.distance_from_start - previous.distance_from_start,
+                )
+        return total_distance
+
     def _create_single_fallback_segment(self, points: List[TrackPoint]) -> Optional[Any]:
-        """
-        当无法自动分段时，创建一个包含全部轨迹的单一"混合"段
-        """
+        """为一个短但连续的原始轨迹段创建单段兜底。"""
         if len(points) < 2:
             return None
-        
-        # 直接复用 _create_segment 逻辑
         return self.processor._create_segment(points, 0, len(points) - 1)
 
     def _get_segment_color(self, segment_type: str) -> str:
@@ -342,7 +373,7 @@ class SegmentationAgent(BaseAgent):
             confidence -= 0.1
         
         # 6. 生成唯一ID
-        segment_id = f"seg_{index + 1:03d}"
+        segment_id = f"slope_seg_{index + 1:03d}"
         
         # 7. 序号
         sequence_number = index + 1
@@ -364,6 +395,7 @@ class SegmentationAgent(BaseAgent):
             "elevation_loss": round(segment.elevation_loss_m, 1),
             "estimated_time": time_minutes,
             "difficulty": difficulty,
+            "scheme_type": "slope",
             
             # 轨迹点索引范围
             "track_start_index": segment.start_index,
@@ -642,10 +674,13 @@ class SegmentationAgent(BaseAgent):
         for i in range(1, len(points)):
             prev = points[i - 1]
             curr = points[i]
+            starts_new_source_segment = curr.segment_index != prev.segment_index
+            exceeds_time_gap = False
             if prev.timestamp and curr.timestamp:
                 diff = (curr.timestamp - prev.timestamp).total_seconds()
-                if diff > gap_threshold_seconds:
-                    day_groups.append([])  # 新开一天
+                exceeds_time_gap = diff > gap_threshold_seconds
+            if starts_new_source_segment or exceeds_time_gap:
+                day_groups.append([])
             day_groups[-1].append(i)
 
         if len(day_groups) <= 1:
@@ -684,8 +719,9 @@ class SegmentationAgent(BaseAgent):
                 "distance": round(total_dist, 2),
                 "elevation_gain": round(total_gain, 1),
                 "elevation_loss": round(total_loss, 1),
-                "estimated_time": None,
-                "difficulty": None,
+                "estimated_time": 0,
+                "difficulty": 1,
+                "scheme_type": "day",
                 "track_start_index": start_i,
                 "track_end_index": end_i,
                 "start_point": {
@@ -722,3 +758,10 @@ class SegmentationAgent(BaseAgent):
             "overall_progress": 30,
             "warnings": [{"level": "warning", "message": message}]
         }
+
+    def _fatal_result(self, message: str) -> Dict[str, Any]:
+        """返回会终止工作流的分段错误。"""
+        result = self._empty_result(message)
+        result["current_step"] = "segmentation_failed"
+        result["errors"] = [f"FATAL: {message}"]
+        return result

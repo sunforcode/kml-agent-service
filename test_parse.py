@@ -2,7 +2,8 @@ import asyncio, httpx, sys
 sys.path.insert(0, '.')
 from app.core.track_processor import create_default_processor
 
-async def test():
+
+async def main():
     async with httpx.AsyncClient() as client:
         r = await client.get('http://127.0.0.1:8080/walkbg/static/kml/wutaishan.kml')
         content = r.text
@@ -21,4 +22,6 @@ async def test():
         if gx_coords:
             print(f'第一个 gx:coord: {gx_coords[0].text}')
 
-asyncio.run(test())
+
+if __name__ == "__main__":
+    asyncio.run(main())

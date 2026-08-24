@@ -120,8 +120,10 @@ def _merge_group(segs: List[Dict[str, Any]], new_index: int, new_total: int) -> 
         raise ValueError("合并段列表不能为空")
     if len(segs) == 1:
         s = dict(segs[0])
-        s["id"] = f"seg_{new_index + 1:03d}"
+        scheme_type = s.get("scheme_type", "slope")
+        s["id"] = f"{scheme_type}_seg_{new_index + 1:03d}"
         s["sequence_number"] = new_index + 1
+        s["scheme_type"] = scheme_type
         s["name"] = _suggest_name(
             new_index, new_total,
             s.get("segment_type", "mixed"),
@@ -166,7 +168,7 @@ def _merge_group(segs: List[Dict[str, Any]], new_index: int, new_total: int) -> 
     color = _get_color(merged_type)
 
     return {
-        "id": f"seg_{new_index + 1:03d}",
+        "id": f"slope_seg_{new_index + 1:03d}",
         "name": name,
         "sequence_number": new_index + 1,
         "color": color,
@@ -175,6 +177,7 @@ def _merge_group(segs: List[Dict[str, Any]], new_index: int, new_total: int) -> 
         "elevation_loss": round(total_loss, 1),
         "estimated_time": estimated_time,
         "difficulty": difficulty,
+        "scheme_type": "slope",
         "track_start_index": track_start,
         "track_end_index": track_end,
         "start_point": start_point,
@@ -252,13 +255,33 @@ class SegmentMergeAgent(BaseAgent):
                 logger.info("SegmentMergeAgent: slope 方案段数 ≤ 1，无需合并")
                 return {"current_step": "segment_merge", "overall_progress": 35}
 
-            logger.info(f"SegmentMergeAgent: slope 方案共 {len(segments)} 段，当前跳过 LLM 合并，透传原始分段")
+            merged_segments = await self._llm_merge(segments)
+            track_points = state.get("track_points", [])
+            for segment in merged_segments:
+                start_index = segment.get("track_start_index")
+                end_index = segment.get("track_end_index")
+                if (
+                    start_index is not None
+                    and end_index is not None
+                    and 0 <= start_index < len(track_points)
+                    and 0 <= end_index < len(track_points)
+                    and track_points[start_index].get("segment_index", 0)
+                    != track_points[end_index].get("segment_index", 0)
+                ):
+                    raise ValueError("LLM 合并结果跨越原始轨迹边界")
+
+            updated_schemes = [dict(scheme) for scheme in segment_schemes]
+            updated_schemes[slope_idx] = {
+                **slope_scheme,
+                "segments": merged_segments,
+            }
 
             self.log_complete(
                 original_count=len(segments),
-                merged_count=len(segments),
+                merged_count=len(merged_segments),
             )
             return {
+                "segment_schemes": updated_schemes,
                 "current_step": "segment_merge",
                 "overall_progress": 35,
             }
@@ -266,6 +289,7 @@ class SegmentMergeAgent(BaseAgent):
         except Exception as e:
             self.log_error(e)
             return {
+                "segment_schemes": state.get("segment_schemes", []),
                 "current_step": "segment_merge",
                 "overall_progress": 35,
                 "warnings": [{
@@ -279,12 +303,8 @@ class SegmentMergeAgent(BaseAgent):
     # =========================================================================
 
     async def _llm_merge(self, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """调用 LLM 获取合并方案并执行"""
-        try:
-            llm = self._get_llm()
-        except RuntimeError as e:
-            logger.info(f"SegmentMergeAgent: {e}，跳过合并")
-            return segments
+        """调用 LLM 获取合并方案并执行；失败交给 execute 统一降级。"""
+        llm = self._get_llm()
 
         from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -332,17 +352,12 @@ class SegmentMergeAgent(BaseAgent):
             HumanMessage(content=json.dumps(seg_data, ensure_ascii=False)),
         ]
 
-        try:
-            response = await llm.ainvoke(messages)
-            raw = response.content if hasattr(response, "content") else str(response)
-            merge_groups = self._parse_response(raw, total_segs=len(segments))
-        except Exception as e:
-            logger.warning(f"SegmentMergeAgent: LLM 调用失败，保留原始分段: {e}")
-            return segments
+        response = await llm.ainvoke(messages)
+        raw = response.content if hasattr(response, "content") else str(response)
+        merge_groups = self._parse_response(raw, total_segs=len(segments))
 
         if merge_groups is None:
-            logger.warning(f"SegmentMergeAgent: LLM 输出解析失败，保留原始分段。原始输出: {raw[:200]}")
-            return segments
+            raise ValueError(f"LLM 输出解析失败: {raw[:200]}")
 
         if not merge_groups:
             logger.info("SegmentMergeAgent: LLM 判断无需合并")
@@ -368,20 +383,22 @@ class SegmentMergeAgent(BaseAgent):
                 return []
 
             validated = []
-            seen: set = set()
+            seen: set[int] = set()
             for group in merge_groups_raw:
                 if not isinstance(group, list) or len(group) < 2:
-                    continue
-                seqs = sorted(int(x) for x in group)
+                    return None
+                if any(type(seq) is not int for seq in group):
+                    return None
+                seqs = sorted(group)
                 # 序号范围检查
-                if any(s < 1 or s > total_segs for s in seqs):
-                    continue
+                if any(seq < 1 or seq > total_segs for seq in seqs):
+                    return None
                 # 连续性检查
                 if not all(seqs[i + 1] == seqs[i] + 1 for i in range(len(seqs) - 1)):
-                    continue
+                    return None
                 # 重叠检查
-                if any(s in seen for s in seqs):
-                    continue
+                if any(seq in seen for seq in seqs):
+                    return None
                 seen.update(seqs)
                 validated.append(seqs)
 

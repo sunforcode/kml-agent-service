@@ -153,10 +153,10 @@ def create_initial_state(request_dict: Dict[str, Any]) -> Dict[str, Any]:
         "basic_stats": None,
         
         # 分段结果
-        "segments": [],
+        "segment_schemes": [],
         
         # POI结果
-        "pois": [],
+        "poi_points": [],
         
         # 内容生成结果
         "generated_content": None,

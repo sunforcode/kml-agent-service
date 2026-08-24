@@ -3,7 +3,8 @@ KML Agent Service - 状态模型
 定义LangGraph工作流使用的状态结构
 """
 
-from typing import TypedDict, List, Dict, Any, Optional
+import operator
+from typing import Annotated, TypedDict, List, Dict, Any, Optional
 
 
 class AgentState(TypedDict, total=False):
@@ -29,7 +30,7 @@ class AgentState(TypedDict, total=False):
     # 轨迹分析结果（轨迹分析Agent产出）
     # ========================================
     track_points: List[Dict[str, Any]]
-    """轨迹点列表"""
+    """轨迹点列表；distance_from_start 在 AgentState 中统一使用米。"""
     
     kml_markers: List[Dict[str, Any]]
     """KML标记点列表"""
@@ -113,8 +114,8 @@ class AgentState(TypedDict, total=False):
     # ========================================
     # 错误处理
     # ========================================
-    errors: List[str]
-    """错误列表"""
+    errors: Annotated[List[str], operator.add]
+    """错误列表；各节点仅返回新增项，由 LangGraph reducer 累加。"""
     
-    warnings: List[Dict[str, Any]]
-    """警告列表"""
+    warnings: Annotated[List[Dict[str, Any]], operator.add]
+    """警告列表；各节点仅返回新增项，由 LangGraph reducer 累加。"""

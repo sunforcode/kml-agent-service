@@ -1,0 +1,25 @@
+# 构建上下文排除项
+# .venv 必须排除：本地是 macOS/arm64 虚拟环境，
+# 带入 Linux 容器不可用，且体积很大。
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+
+.git
+.gitignore
+
+# .env 含 API Key，绝不进镜像；配置由运行时环境变量注入
+.env
+.env.*
+!.env.example
+
+.DS_Store
+*.log
+logs
+.pytest_cache
+.coverage
+htmlcov
+Dockerfile
+.dockerignore

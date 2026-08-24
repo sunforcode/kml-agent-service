@@ -29,13 +29,15 @@ KML 分析工作流 (Analysis Workflow)
 - aggregate_result -> end
 """
 
+import inspect
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Union
 from datetime import datetime
 
 from langgraph.graph import StateGraph, END
 
 from app.models.state import AgentState
+from app.models.response import EnhancedRouteOutput
 from app.agents.base import BaseAgent, create_initial_state
 from app.agents.trajectory_agent import TrajectoryAgent
 from app.agents.segmentation_agent import SegmentationAgent
@@ -119,7 +121,14 @@ class AnalysisWorkflow(BaseAgent):
             }
         )
         
-        graph.add_edge("segment_route", "merge_segments")
+        graph.add_conditional_edges(
+            "segment_route",
+            self._route_after_segmentation,
+            {
+                "continue": "merge_segments",
+                "fail": END,
+            },
+        )
         graph.add_edge("merge_segments", "recognize_poi")
         
         # 条件边：判断是否需要内容生成
@@ -152,8 +161,6 @@ class AnalysisWorkflow(BaseAgent):
             "kml_markers": state.get("kml_markers", []),
             "segment_schemes": state.get("segment_schemes", []),
             "poi_points": state.get("poi_points", []),
-            "errors": state.get("errors", []),
-            "warnings": state.get("warnings", []),
             "current_step": "init",
             "overall_progress": 5
         }
@@ -268,20 +275,15 @@ class AnalysisWorkflow(BaseAgent):
             return await self.quality_agent.execute(state)
         except Exception as e:
             logger.error(f"质量评估失败: {str(e)}")
-            return {
-                "quality_assessment": {
-                    "overall_score": 70.0,
-                    "warnings": [{"level": "warning", "message": f"质量评估失败: {str(e)}"}]
-                },
-                "current_step": "quality_assessment_failed",
-                "overall_progress": state.get("overall_progress", 0)
-            }
+            raise RuntimeError(f"QUALITY_ASSESSMENT_ERROR: {str(e)}") from e
     
     async def _aggregate_result_node(self, state: AgentState) -> AgentState:
         """结果汇总节点：汇总所有Agent输出，生成最终结果"""
         logger.info("执行结果汇总节点")
         
-        final_result = self._build_final_result(state)
+        final_result = EnhancedRouteOutput.model_validate(
+            self._build_final_result(state)
+        ).model_dump(mode="json")
         self.log_complete()
         return {
             "final_result": final_result,
@@ -313,6 +315,16 @@ class AnalysisWorkflow(BaseAgent):
         
         return "continue"
     
+    def _route_after_segmentation(self, state: AgentState) -> str:
+        """分段失败时终止工作流，避免把空坡度方案汇总为 completed。"""
+        fatal_errors = [
+            error for error in state.get("errors", []) if "FATAL" in str(error).upper()
+        ]
+        if fatal_errors:
+            logger.error(f"路径分段失败，错误: {fatal_errors}")
+            return "fail"
+        return "continue"
+
     def _should_generate_content(self, state: AgentState) -> str:
         """判断是否需要内容生成：返回 "generate" 或 "skip" """
         request = state.get("request", {})
@@ -328,6 +340,55 @@ class AnalysisWorkflow(BaseAgent):
     # ========================================
     # 结果构建
     # ========================================
+
+    @staticmethod
+    def _estimate_route_difficulty(
+        request: Dict[str, Any],
+        basic_stats: Dict[str, Any],
+        segment_schemes: list[Dict[str, Any]],
+    ) -> int:
+        explicit = request.get("estimated_difficulty")
+        if explicit is not None:
+            return max(1, min(5, int(explicit)))
+
+        default_slope = next(
+            (
+                scheme
+                for scheme in segment_schemes
+                if scheme.get("scheme_type") == "slope" and scheme.get("is_default", False)
+            ),
+            None,
+        )
+        if default_slope is not None:
+            weighted_segments = [
+                segment
+                for segment in default_slope.get("segments", [])
+                if float(segment.get("distance", 0) or 0) > 0
+                and segment.get("difficulty") is not None
+            ]
+            total_distance = sum(float(segment["distance"]) for segment in weighted_segments)
+            if total_distance > 0:
+                weighted_difficulty = sum(
+                    float(segment["difficulty"]) * float(segment["distance"])
+                    for segment in weighted_segments
+                ) / total_distance
+                return max(1, min(5, round(weighted_difficulty)))
+
+        distance_km = float(
+            basic_stats.get("total_distance_km", basic_stats.get("distance_km", 0)) or 0
+        )
+        elevation_gain = float(
+            basic_stats.get("total_gain_m", basic_stats.get("elevation_gain", 0)) or 0
+        )
+        if distance_km >= 20 or elevation_gain >= 1000:
+            return 5
+        if distance_km >= 15 or elevation_gain >= 800:
+            return 4
+        if distance_km >= 10 or elevation_gain >= 600:
+            return 3
+        if distance_km >= 5 or elevation_gain >= 300:
+            return 2
+        return 1
     
     def _build_final_result(self, state: AgentState) -> Dict[str, Any]:
         """
@@ -344,12 +405,13 @@ class AnalysisWorkflow(BaseAgent):
         quality_assessment = state.get("quality_assessment") or {}
         warnings = state.get("warnings", [])
         errors = state.get("errors", [])
+        request = state.get("request", {})
         
         return {
             # 元数据
             "source_kml_url": state.get("request", {}).get("kml_source", ""),
             "analysis_timestamp": datetime.utcnow().isoformat(),
-            "quality_score": quality_assessment.get("overall_score", 70.0),
+            "quality_score": quality_assessment.get("overall_score", 0.0),
             
             # 路线统计
             "total_distance_km": basic_stats.get("total_distance_km", 0),
@@ -358,7 +420,9 @@ class AnalysisWorkflow(BaseAgent):
             "max_elevation": basic_stats.get("max_elevation", 0),
             "min_elevation": basic_stats.get("min_elevation", 0),
             "is_loop": basic_stats.get("is_loop", False),
-            "estimated_difficulty": basic_stats.get("data_quality_score", 70) // 20,
+            "estimated_difficulty": self._estimate_route_difficulty(
+                request, basic_stats, segment_schemes
+            ),
 
             # 多方案分段 + 统一 POI
             "segment_schemes": segment_schemes,
@@ -403,24 +467,35 @@ class AnalysisWorkflow(BaseAgent):
     # 执行入口
     # ========================================
     
-    async def execute_workflow(self, request_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        执行完整工作流
-
-        Args:
-            request_dict: 分析请求的字典形式
-
-        Returns:
-            最终分析结果
-        """
+    async def execute_workflow(
+        self,
+        request_dict: Dict[str, Any],
+        progress_callback: Optional[
+            Callable[[str, int], Union[None, Awaitable[None]]]
+        ] = None,
+    ) -> Dict[str, Any]:
+        """执行工作流，并在每个已完成节点后报告单调进度。"""
         self.log_start()
-        
         initial_state = create_initial_state(request_dict)
-        
+        final_state: Dict[str, Any] = initial_state
+        last_progress = 0
+
         logger.info("开始执行工作流")
-        final_state = await self._compiled.ainvoke(initial_state)
-        
+        async for state in self._compiled.astream(initial_state, stream_mode="values"):
+            final_state = state
+            progress = max(last_progress, int(state.get("overall_progress", 0)))
+            step = state.get("current_step", "unknown")
+            if progress_callback is not None and progress > last_progress and progress > 0:
+                callback_result = progress_callback(step, progress)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
+            last_progress = progress
+
         result = final_state.get("final_result")
-        
+        if result is None:
+            errors = final_state.get("errors") or ["工作流未生成最终结果"]
+            raise RuntimeError("; ".join(str(error) for error in errors))
+
+        validated = EnhancedRouteOutput.model_validate(result).model_dump(mode="json")
         self.log_complete()
-        return result or {}
+        return validated

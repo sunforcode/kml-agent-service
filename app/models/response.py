@@ -3,10 +3,16 @@ KML Agent Service - 请求数据模型
 定义API请求的Pydantic模型
 """
 
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from typing import Annotated, Literal, Optional, List, Dict, Any
 from enum import IntEnum
 from datetime import datetime
+
+
+NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+HexColor = Annotated[str, StringConstraints(pattern=r"^#[0-9A-Fa-f]{6}$")]
+POICategory = Literal["water", "camp", "supply", "photo", "pass", "valley", "weather", "danger", "start", "end"]
+POISource = Literal["kml_marker", "osm", "algorithm", "weather_api", "experience"]
 
 
 class RouteDifficulty(IntEnum):
@@ -152,6 +158,8 @@ class TrackPointOutput(BaseModel):
     timestamp: Optional[datetime] = None
     """时间戳（可选）"""
 
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
 
 class SegmentOutput(BaseModel):
     """路段输出
@@ -165,16 +173,16 @@ class SegmentOutput(BaseModel):
     - walkbg/walkfg 使用 camelCase，需要通过 @JsonProperty/@JsonKey 映射
     """
     
-    id: str
+    id: NonEmptyString
     """唯一ID"""
     
-    name: str
+    name: NonEmptyString
     """路段名称"""
     
-    sequence_number: int
+    sequence_number: int = Field(ge=1)
     """序号（用于排序，从1开始）"""
     
-    color: str
+    color: HexColor
     """显示颜色（如 #FF5722）"""
     
     description: Optional[str] = None
@@ -184,20 +192,23 @@ class SegmentOutput(BaseModel):
     # 数值字段
     # ========================================
     
-    distance: float
+    distance: float = Field(ge=0)
     """距离（公里）"""
     
-    elevation_gain: float
+    elevation_gain: float = Field(ge=0)
     """爬升（米）"""
     
-    elevation_loss: float
+    elevation_loss: float = Field(ge=0)
     """下降（米）"""
     
-    estimated_time: int
+    estimated_time: int = Field(ge=0)
     """预计时间（分钟）"""
     
-    difficulty: int
+    difficulty: int = Field(ge=1, le=5)
     """难度等级（1-5）"""
+
+    scheme_type: NonEmptyString
+    """所属分段方案类型"""
     
     # ========================================
     # 轨迹点索引范围
@@ -239,7 +250,7 @@ class SegmentOutput(BaseModel):
     max_slope_degrees: Optional[float] = None
     """最大坡度（度）"""
     
-    confidence: Optional[float] = None
+    confidence: Optional[float] = Field(default=None, ge=0, le=1)
     """分段置信度（0.0-1.0）"""
     
     # ========================================
@@ -249,70 +260,43 @@ class SegmentOutput(BaseModel):
     notes: Optional[str] = None
     """备注"""
 
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+
+class SegmentSchemeOutput(BaseModel):
+    """一套路线分段方案。"""
+
+    scheme_type: NonEmptyString
+    label: NonEmptyString
+    is_default: bool
+    segments: List[SegmentOutput]
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_scheme_consistency(self):
+        if self.scheme_type == "slope" and not self.segments:
+            raise ValueError("slope scheme must contain at least one segment")
+        if any(segment.scheme_type != self.scheme_type for segment in self.segments):
+            raise ValueError("segment scheme_type must match parent scheme_type")
+        return self
+
 
 class POIOutput(BaseModel):
-    """POI输出基类"""
-    
-    name: Optional[str] = None
-    """名称"""
-    
-    latitude: float
-    """纬度"""
-    
-    longitude: float
-    """经度"""
-    
-    description: Optional[str] = None
-    """描述"""
-    
-    notes: Optional[str] = None
-    """备注"""
+    """统一 POI 输出。"""
 
-
-class WaterSourceOutput(POIOutput):
-    """水源输出"""
-    
-    source_type: str = "unknown"
-    """水源类型：spring/tap/river/unknown"""
-    
-    reliability: float = 0.5
-    """可靠性（0.0-1.0）"""
-
-
-class CampsiteOutput(POIOutput):
-    """营地输出"""
-    
-    capacity: Optional[int] = None
-    """容量"""
-    
-    has_water: Optional[bool] = None
-    """是否有水源"""
-    
-    has_facilities: Optional[bool] = None
-    """是否有设施"""
-
-
-class SupplyOutput(POIOutput):
-    """补给点输出"""
-    
-    supply_type: str = "unknown"
-    """补给类型：shop/restaurant/vending_machine/unknown"""
-
-
-class MarkerPointOutput(POIOutput):
-    """标记点输出"""
-    
+    category: POICategory
+    name: NonEmptyString
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    source: POISource
     elevation: Optional[float] = None
-    """海拔（米）"""
-    
-    type: str = "viewpoint"
-    """类型：viewpoint/danger/photo/note"""
-    
-    image_url: Optional[str] = None
-    """图片链接"""
-    
-    icon_url: Optional[str] = None
-    """图标链接"""
+    sub_category: Optional[str] = None
+    description: Optional[str] = None
+    confidence: float = Field(ge=0, le=1)
+    card_data: Optional[Dict[str, Any]] = None
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
 class WarningOutput(BaseModel):
@@ -329,6 +313,8 @@ class WarningOutput(BaseModel):
     
     detail: Optional[str] = None
     """详细信息"""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
 class EnhancedRouteOutput(BaseModel):
@@ -375,25 +361,13 @@ class EnhancedRouteOutput(BaseModel):
     """预估难度等级（1-5）"""
     
     # ========================================
-    # 路段数据
+    # 路段与 POI 数据
     # ========================================
-    segments: List[SegmentOutput]
-    """路段列表"""
-    
-    # ========================================
-    # POI数据
-    # ========================================
-    water_sources: List[WaterSourceOutput]
-    """水源列表"""
-    
-    campsites: List[CampsiteOutput]
-    """营地列表"""
-    
-    supplies: List[SupplyOutput]
-    """补给点列表"""
-    
-    marker_points: List[MarkerPointOutput]
-    """标记点列表"""
+    segment_schemes: List[SegmentSchemeOutput]
+    """多方案分段列表"""
+
+    poi_points: List[POIOutput]
+    """统一 POI 列表"""
     
     # ========================================
     # 生成内容（可选）
@@ -424,3 +398,5 @@ class EnhancedRouteOutput(BaseModel):
     # ========================================
     raw_analysis_data: Optional[Dict[str, Any]] = None
     """原始分析数据（可选）"""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
