@@ -171,9 +171,12 @@ def create_initial_state(request_dict: Dict[str, Any]) -> Dict[str, Any]:
         "current_step": "init",
         "overall_progress": 0,
         
-        # 错误和警告
+        # 错误、警告与可观测性状态
         "errors": [],
-        "warnings": []
+        "warnings": [],
+        "execution_events": [],
+        "degraded": False,
+        "generation_modes": {},
     }
 
 

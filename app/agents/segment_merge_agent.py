@@ -25,6 +25,7 @@ from typing import Dict, Any, List, Optional
 
 from app.agents.base import BaseAgent
 from app.core.config import settings
+from app.models.execution_event import build_execution_event, classify_safe_error
 
 logger = logging.getLogger(__name__)
 
@@ -284,18 +285,47 @@ class SegmentMergeAgent(BaseAgent):
                 "segment_schemes": updated_schemes,
                 "current_step": "segment_merge",
                 "overall_progress": 35,
+                "execution_events": [build_execution_event(
+                    node=self.name,
+                    phase="llm_completed",
+                    level="info",
+                    message="LLM 分段合并评估成功",
+                    progress=35,
+                    details={"generation_mode": "llm"},
+                )],
+                "degraded": False,
+                "generation_modes": {self.name: "llm"},
+                "generation_mode": "llm",
             }
 
         except Exception as e:
             self.log_error(e)
+            safe_error = classify_safe_error(e)
+            warning_message = (
+                "LLM 合并结果跨越原始轨迹边界，分段保持原样"
+                if "原始轨迹边界" in str(e)
+                else "SegmentMergeAgent 执行失败，分段保持原样"
+            )
             return {
                 "segment_schemes": state.get("segment_schemes", []),
                 "current_step": "segment_merge",
                 "overall_progress": 35,
                 "warnings": [{
                     "level": "warning",
-                    "message": f"SegmentMergeAgent 执行失败，分段保持原样: {str(e)}",
+                    "message": warning_message,
+                    "detail": safe_error["summary"],
                 }],
+                "execution_events": [build_execution_event(
+                    node=self.name,
+                    phase="degraded",
+                    level="warning",
+                    message="分段合并已降级为保持原始分段",
+                    progress=35,
+                    details=safe_error,
+                )],
+                "degraded": True,
+                "generation_modes": {self.name: "fallback"},
+                "generation_mode": "fallback",
             }
 
     # =========================================================================

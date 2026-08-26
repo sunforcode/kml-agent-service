@@ -386,6 +386,12 @@ class EnhancedRouteOutput(BaseModel):
     
     equipment_recommendations: List[str] = []
     """装备推荐列表"""
+
+    generation_mode: Optional[str] = None
+    """本次 LLM 生成模式：llm/fallback/disabled。"""
+
+    degraded: bool = False
+    """任一 LLM Agent 使用 fallback 时为 True。"""
     
     # ========================================
     # 质量信息

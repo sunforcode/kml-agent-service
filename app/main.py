@@ -315,7 +315,12 @@ async def execute_analysis_async(task_id: str, request_dict: Dict[str, Any]):
             result = await workflow.execute_workflow(
                 request_dict,
                 progress_callback=report_progress,
+                execution_event_callback=lambda event: callback_service.dispatch_execution_event(
+                    task_id, event
+                ),
             )
+
+            await callback_service.drain_execution_events(task_id)
 
             # 回调是分析结果落库的唯一途径，结果必须检查：
             # 回调失败意味着 walkbg 侧永远看不到本次分析结果。
@@ -345,6 +350,7 @@ async def execute_analysis_async(task_id: str, request_dict: Dict[str, Any]):
             "error": str(e),
             "warnings": [{"level": "error", "message": str(e)}]
         }
+        await callback_service.drain_execution_events(task_id)
         delivered = await callback_service.send_callback(
             task_id=task_id,
             route_id=route_id,

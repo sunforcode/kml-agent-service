@@ -14,6 +14,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 from app.core.config import settings
+from app.models.execution_event import ExecutionEvent, classify_safe_error
 from app.models.response import EnhancedRouteOutput
 from app.services.task_service import _sanitize_for_json
 
@@ -36,6 +37,11 @@ class CallbackService:
         self.retry_base_delay = settings.walkbg_callback_retry_base_delay
 
         self.full_callback_url = f"{self.base_url}{self.callback_endpoint}"
+        self.execution_event_endpoint = settings.walkbg_execution_event_endpoint
+        self._event_delivery_queues: Dict[
+            str, asyncio.Queue[ExecutionEvent | Dict[str, Any]]
+        ] = {}
+        self._event_delivery_tasks: Dict[str, asyncio.Task[None]] = {}
 
         logger.info(
             f"回调服务初始化: enabled={self.enabled}, "
@@ -97,6 +103,94 @@ class CallbackService:
             f"attempts={self.max_attempts}, last_error={last_error}"
         )
         return False
+
+    @property
+    def pending_event_deliveries(self) -> int:
+        return len(self._event_delivery_tasks)
+
+    def dispatch_execution_event(
+        self,
+        task_id: str,
+        event: ExecutionEvent | Dict[str, Any],
+    ) -> None:
+        """Enqueue best-effort delivery without blocking the workflow."""
+        queue = self._event_delivery_queues.get(task_id)
+        worker = self._event_delivery_tasks.get(task_id)
+        if queue is None or worker is None or worker.done():
+            queue = asyncio.Queue()
+            worker = asyncio.create_task(self._deliver_execution_events(task_id, queue))
+            self._event_delivery_queues[task_id] = queue
+            self._event_delivery_tasks[task_id] = worker
+        queue.put_nowait(event)
+
+    async def _deliver_execution_events(
+        self,
+        task_id: str,
+        queue: asyncio.Queue[ExecutionEvent | Dict[str, Any]],
+    ) -> None:
+        """Deliver one task's events serially in dispatch order."""
+        while True:
+            event = await queue.get()
+            try:
+                await self.send_execution_event(task_id, event)
+            finally:
+                queue.task_done()
+
+    async def drain_execution_events(
+        self,
+        task_id: str,
+        timeout: Optional[float] = None,
+    ) -> None:
+        """Wait for one task's queue, then cancel its worker and clean up."""
+        queue = self._event_delivery_queues.get(task_id)
+        worker = self._event_delivery_tasks.get(task_id)
+        if queue is None or worker is None:
+            return
+
+        try:
+            if timeout is None:
+                await queue.join()
+            else:
+                await asyncio.wait_for(queue.join(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+            if self._event_delivery_tasks.get(task_id) is worker:
+                self._event_delivery_tasks.pop(task_id, None)
+                self._event_delivery_queues.pop(task_id, None)
+
+    async def send_execution_event(
+        self,
+        task_id: str,
+        event: ExecutionEvent | Dict[str, Any],
+    ) -> bool:
+        """Best-effort event delivery; failures never affect analysis execution."""
+        if not self.enabled:
+            return True
+
+        try:
+            event_model = event if isinstance(event, ExecutionEvent) else ExecutionEvent.model_validate(event)
+            await self._post_execution_event(task_id, event_model.model_dump(mode="json"))
+            return True
+        except Exception as exc:
+            logger.warning(
+                "执行事件发送失败，分析继续: task_id=%s, error_type=%s",
+                task_id,
+                type(exc).__name__,
+            )
+            return False
+
+    async def _post_execution_event(self, task_id: str, event: Dict[str, Any]) -> None:
+        endpoint = self.execution_event_endpoint.format(task_id=task_id)
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.base_url}{endpoint}",
+                json={"task_id": task_id, "execution_event": event},
+                headers={"Content-Type": "application/json"},
+            )
+            response.raise_for_status()
 
     async def _attempt_callback(
         self,
@@ -185,9 +279,17 @@ class CallbackService:
             "generated_difficulties": result.get("generated_difficulties", []),
             "generated_safety_notes": result.get("generated_safety_notes", []),
             "equipment_recommendations": result.get("equipment_recommendations", []),
+            "generation_mode": result.get("generation_mode"),
+            "degraded": bool(result.get("degraded", False)),
             "warnings": result.get("warnings", [])
         }
-        
+        if status == "failed":
+            safe_error = classify_safe_error(RuntimeError(str(result.get("error") or "")))
+            payload["error"] = safe_error["summary"]
+            payload["warnings"] = [
+                {"level": "error", "message": safe_error["summary"]}
+            ]
+
         return payload
 
     def _convert_segment_schemes(self, schemes: list) -> list:

@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     # 单机 Compose 下为服务名，拆分主机后为内网地址，必须由环境注入。
     walkbg_base_url: str = "http://localhost:8080"
     walkbg_callback_endpoint: str = "/walkbg/api/v1/route-analysis/callback"
+    walkbg_execution_event_endpoint: str = "/walkbg/api/v1/route-analysis/tasks/{task_id}/events"
     walkbg_api_timeout: int = 30
     walkbg_callback_enabled: bool = True
     # 回调重试次数（含首次尝试）与指数退避的基准秒数。

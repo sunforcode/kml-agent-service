@@ -119,3 +119,12 @@ class AgentState(TypedDict, total=False):
     
     warnings: Annotated[List[Dict[str, Any]], operator.add]
     """警告列表；各节点仅返回新增项，由 LangGraph reducer 累加。"""
+
+    execution_events: Annotated[List[Dict[str, Any]], operator.add]
+    """结构化执行事件；各节点仅返回新增项，由 LangGraph reducer 累加。"""
+
+    degraded: Annotated[bool, operator.or_]
+    """任一 Agent 进入 fallback 时为 True。"""
+
+    generation_modes: Annotated[Dict[str, str], operator.or_]
+    """使用 LLM 的 Agent 对应 generation mode。"""

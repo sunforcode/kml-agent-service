@@ -12,6 +12,7 @@ from app.agents.quality_agent import QualityAgent
 from app.agents.segment_merge_agent import SegmentMergeAgent
 from app.agents.segmentation_agent import SegmentationAgent
 from app.agents.trajectory_agent import TrajectoryAgent
+from app.models.execution_event import ExecutionEvent, classify_safe_error
 from app.models.response import EnhancedRouteOutput
 from app.core.track_processor import TrackProcessor
 from app.models.state import AgentState
@@ -145,6 +146,9 @@ async def test_content_agent_parses_structured_llm_json(monkeypatch):
 
     assert update["generated_content"]["description"] == "基于轨迹统计生成的描述"
     assert update["generated_content"]["generation_mode"] == "llm"
+    assert update["execution_events"][0]["phase"] == "llm_completed"
+    assert update["execution_events"][0]["level"] == "info"
+    assert update["degraded"] is False
     assert "warnings" not in update
 
 
@@ -167,6 +171,10 @@ async def test_content_agent_falls_back_without_invented_facts(monkeypatch, fail
     assert update["generated_content"]["generation_mode"] == "fallback"
     assert "1.5" in update["generated_content"]["description"]
     assert update["warnings"]
+    assert update["execution_events"][0]["phase"] == "degraded"
+    assert update["execution_events"][0]["level"] == "warning"
+    assert update["execution_events"][0]["details"]["error_category"]
+    assert update["degraded"] is True
     assert "五台山" not in serialized
     assert "prompt_tokens" not in serialized
     assert "external_api_calls" not in serialized
@@ -185,6 +193,8 @@ async def test_segment_merge_execute_uses_llm_result(monkeypatch):
 
     call.assert_awaited_once()
     assert update["segment_schemes"][0]["segments"] == merged
+    assert update["generation_mode"] == "llm"
+    assert update["execution_events"][0]["phase"] == "llm_completed"
 
 
 @pytest.mark.asyncio
@@ -199,6 +209,9 @@ async def test_segment_merge_failure_preserves_segments_and_warns(monkeypatch):
 
     assert update["segment_schemes"][0]["segments"] == original
     assert update["warnings"]
+    assert update["generation_mode"] == "fallback"
+    assert update["degraded"] is True
+    assert update["execution_events"][0]["phase"] == "degraded"
 
 
 @pytest.mark.asyncio
@@ -252,11 +265,15 @@ async def test_workflow_reports_monotonic_progress_to_sync_callback():
 
 
 def test_callback_payload_uses_new_contract_only():
-    payload = CallbackService()._build_callback_payload("task-1", "route-1", valid_result(), "completed")
+    result = valid_result()
+    result.update({"generation_mode": "fallback", "degraded": True})
+    payload = CallbackService()._build_callback_payload("task-1", "route-1", result, "completed")
     assert payload["status"] == "completed"
     assert payload["segment_schemes"]
     assert payload["segment_schemes"][0]["segments"][0]["scheme_type"] == "slope"
     assert payload["poi_points"]
+    assert payload["generation_mode"] == "fallback"
+    assert payload["degraded"] is True
     assert "segments" not in payload
     assert "water_sources" not in payload
 
@@ -266,6 +283,23 @@ def test_completed_callback_rejects_invalid_result():
     invalid["poi_points"][0]["confidence"] = 2
     with pytest.raises(ValidationError):
         CallbackService()._build_callback_payload("task-1", "route-1", invalid, "completed")
+
+
+def test_failed_callback_has_non_empty_sanitized_error():
+    payload = CallbackService()._build_callback_payload(
+        "task-1",
+        "route-1",
+        {
+            "error": "401 unauthorized api_key=sk-secret at http://internal.walkbg.local/v1",
+            "warnings": [],
+        },
+        "failed",
+    )
+
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert payload["error"] == "模型服务鉴权失败"
+    assert "sk-secret" not in serialized
+    assert "internal.walkbg.local" not in serialized
 
 
 @pytest.mark.asyncio
@@ -297,7 +331,7 @@ async def test_main_syncs_workflow_progress_and_completed_callback(monkeypatch):
     task_id = main.task_manager.create_task({"kml_source": "inline.kml"})
 
     class SuccessfulWorkflow:
-        async def execute_workflow(self, _request, progress_callback):
+        async def execute_workflow(self, _request, progress_callback, execution_event_callback=None):
             await progress_callback("trajectory_analysis", 15)
             await progress_callback("quality_assessment", 85)
             return valid_result()
@@ -322,7 +356,7 @@ async def test_main_marks_workflow_failure_and_sends_failed_callback(monkeypatch
     task_id = main.task_manager.create_task({"kml_source": "inline.kml"})
 
     class FailedWorkflow:
-        async def execute_workflow(self, _request, progress_callback):
+        async def execute_workflow(self, _request, progress_callback, execution_event_callback=None):
             await progress_callback("trajectory_analysis_failed", 15)
             raise RuntimeError("FATAL: invalid trajectory")
 
@@ -455,7 +489,7 @@ async def test_main_keeps_task_processing_until_completed_callback_returns(monke
     release_callback = asyncio.Event()
 
     class SuccessfulWorkflow:
-        async def execute_workflow(self, _request, progress_callback):
+        async def execute_workflow(self, _request, progress_callback, execution_event_callback=None):
             return valid_result()
 
     async def blocking_callback(**_kwargs):
@@ -493,7 +527,7 @@ async def test_main_marks_completed_analysis_failed_when_callback_is_not_deliver
     task_id = main.task_manager.create_task({"kml_source": "inline.kml"})
 
     class SuccessfulWorkflow:
-        async def execute_workflow(self, _request, progress_callback):
+        async def execute_workflow(self, _request, progress_callback, execution_event_callback=None):
             return valid_result()
 
     monkeypatch.setattr(main, "workflow", SuccessfulWorkflow())
@@ -922,3 +956,486 @@ async def test_segment_merge_does_not_accept_a_cross_source_boundary_merge(monke
     assert update["segment_schemes"][0]["segments"] == original
     assert update["warnings"]
     assert "原始轨迹边界" in update["warnings"][0]["message"]
+
+
+def test_execution_event_contract_and_safe_error_classification():
+    event = ExecutionEvent(
+        node="content_agent",
+        phase="degraded",
+        level="warning",
+        message="内容生成已降级",
+        progress=65,
+        details=classify_safe_error(
+            RuntimeError(
+                "401 unauthorized api_key=sk-secret at http://internal.walkbg.local/v1"
+            )
+        ),
+    ).model_dump(mode="json")
+
+    serialized = json.dumps(event, ensure_ascii=False)
+    assert event["timestamp"]
+    assert event["details"]["error_category"] == "authentication"
+    assert event["details"]["summary"] == "模型服务鉴权失败"
+    assert "sk-secret" not in serialized
+    assert "internal.walkbg.local" not in serialized
+    assert "Traceback" not in serialized
+
+
+def test_safe_error_classification_distinguishes_missing_configuration():
+    classified = classify_safe_error(RuntimeError("OPENAI_API_KEY 未配置"))
+
+    assert classified == {
+        "error_category": "configuration",
+        "summary": "模型服务配置缺失",
+    }
+
+
+@pytest.mark.asyncio
+async def test_execution_event_delivery_failure_is_non_blocking(monkeypatch):
+    service = CallbackService()
+    monkeypatch.setattr(service, "enabled", True)
+    monkeypatch.setattr(
+        service,
+        "_post_execution_event",
+        AsyncMock(side_effect=RuntimeError("walkbg unavailable")),
+    )
+    event = ExecutionEvent(
+        node="content_agent",
+        phase="started",
+        level="info",
+        message="开始生成路线内容",
+        progress=60,
+    )
+
+    assert await service.send_execution_event("task-1", event) is False
+
+
+@pytest.mark.asyncio
+async def test_execution_event_delivery_uses_walkbg_ingestion_contract(monkeypatch):
+    service = CallbackService()
+    posted = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, json, headers):
+            posted.update({"url": url, "json": json, "headers": headers})
+            return Response()
+
+    monkeypatch.setattr("app.services.callback_service.httpx.AsyncClient", lambda **_kwargs: Client())
+    event = ExecutionEvent(
+        node="content_agent",
+        phase="started",
+        level="info",
+        message="开始生成路线内容",
+        progress=60,
+    )
+
+    assert await service.send_execution_event("task-1", event) is True
+    assert posted["url"].endswith("/tasks/task-1/events")
+    assert posted["json"]["task_id"] == "task-1"
+    assert posted["json"]["execution_event"]["node"] == "content_agent"
+
+
+@pytest.mark.asyncio
+async def test_execution_event_dispatch_returns_before_delivery_finishes(monkeypatch):
+    service = CallbackService()
+    release = asyncio.Event()
+
+    async def blocked_delivery(_task_id, _event):
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(service, "send_execution_event", blocked_delivery)
+    service.dispatch_execution_event(
+        "task-1",
+        ExecutionEvent(
+            node="content_agent",
+            phase="started",
+            level="info",
+            message="开始生成路线内容",
+            progress=60,
+        ),
+    )
+
+    assert service.pending_event_deliveries == 1
+    release.set()
+    await service.drain_execution_events("task-1")
+    assert service.pending_event_deliveries == 0
+
+
+@pytest.mark.asyncio
+async def test_execution_events_keep_dispatch_order_when_first_delivery_is_delayed(monkeypatch):
+    service = CallbackService()
+    release_first = asyncio.Event()
+    delivered = []
+
+    async def delayed_first_delivery(_task_id, event):
+        if event.message == "first":
+            await release_first.wait()
+        delivered.append(event.message)
+        return True
+
+    monkeypatch.setattr(service, "send_execution_event", delayed_first_delivery)
+    service.dispatch_execution_event(
+        "task-1",
+        ExecutionEvent(
+            node="content_agent",
+            phase="started",
+            level="info",
+            message="first",
+            progress=60,
+        ),
+    )
+    service.dispatch_execution_event(
+        "task-1",
+        ExecutionEvent(
+            node="content_agent",
+            phase="completed",
+            level="info",
+            message="second",
+            progress=65,
+        ),
+    )
+
+    await asyncio.sleep(0)
+    assert delivered == []
+
+    release_first.set()
+    await service.drain_execution_events("task-1")
+
+    assert delivered == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_execution_event_drain_does_not_wait_for_other_tasks(monkeypatch):
+    service = CallbackService()
+    release_task_1 = asyncio.Event()
+    task_2_delivered = asyncio.Event()
+
+    async def deliver_by_task(task_id, _event):
+        if task_id == "task-1":
+            await release_task_1.wait()
+        else:
+            task_2_delivered.set()
+        return True
+
+    monkeypatch.setattr(service, "send_execution_event", deliver_by_task)
+    event = ExecutionEvent(
+        node="content_agent",
+        phase="started",
+        level="info",
+        message="开始生成路线内容",
+        progress=60,
+    )
+    service.dispatch_execution_event("task-1", event)
+    service.dispatch_execution_event("task-2", event)
+
+    await service.drain_execution_events("task-2", timeout=0.1)
+
+    assert task_2_delivered.is_set()
+    assert service.pending_event_deliveries == 1
+    release_task_1.set()
+    await service.drain_execution_events("task-1")
+
+
+@pytest.mark.asyncio
+async def test_execution_event_drain_cancels_timed_out_delivery_and_cleans_up(monkeypatch):
+    service = CallbackService()
+    cancelled = asyncio.Event()
+
+    async def never_finishes(_task_id, _event):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(service, "send_execution_event", never_finishes)
+    service.dispatch_execution_event(
+        "task-1",
+        ExecutionEvent(
+            node="content_agent",
+            phase="started",
+            level="info",
+            message="开始生成路线内容",
+            progress=60,
+        ),
+    )
+
+    await service.drain_execution_events("task-1", timeout=0.01)
+
+    assert cancelled.is_set()
+    assert service.pending_event_deliveries == 0
+
+
+@pytest.mark.asyncio
+async def test_main_default_drain_allows_event_beyond_legacy_timeout_before_completed_callback(monkeypatch):
+    from app import main
+
+    task_id = main.task_manager.create_task({"kml_source": "inline.kml"})
+    event_delivery_started = asyncio.Event()
+    release_event_delivery = asyncio.Event()
+    delivery_cancelled = asyncio.Event()
+    call_order = []
+
+    class SuccessfulWorkflow:
+        async def execute_workflow(self, _request, progress_callback, execution_event_callback=None):
+            execution_event_callback(
+                ExecutionEvent(
+                    node="content_agent",
+                    phase="completed",
+                    level="info",
+                    message="路线内容生成完成",
+                    progress=65,
+                )
+            )
+            return valid_result()
+
+    async def blocked_event_delivery(delivery_task_id, _event):
+        assert delivery_task_id == task_id
+        event_delivery_started.set()
+        try:
+            await release_event_delivery.wait()
+        finally:
+            if not release_event_delivery.is_set():
+                delivery_cancelled.set()
+        call_order.append("event")
+        return True
+
+    wait_for_timeouts = []
+    original_wait_for = asyncio.wait_for
+
+    async def record_wait_for(awaitable, timeout):
+        wait_for_timeouts.append(timeout)
+        return await original_wait_for(awaitable, timeout)
+
+    async def record_callback(**_kwargs):
+        call_order.append("callback")
+        return True
+
+    monkeypatch.setattr(main, "workflow", SuccessfulWorkflow())
+    monkeypatch.setattr(main.callback_service, "send_execution_event", blocked_event_delivery)
+    monkeypatch.setattr(main.callback_service, "send_callback", record_callback)
+    monkeypatch.setattr("app.services.callback_service.asyncio.wait_for", record_wait_for)
+
+    execution = asyncio.create_task(
+        main.execute_analysis_async(task_id, {"kml_source": "inline.kml", "route_id": "route-1"})
+    )
+    await event_delivery_started.wait()
+    await asyncio.sleep(0)
+    assert call_order == []
+    assert not delivery_cancelled.is_set()
+
+    release_event_delivery.set()
+    await execution
+
+    assert wait_for_timeouts == []
+    assert not delivery_cancelled.is_set()
+    assert call_order == ["event", "callback"]
+
+
+@pytest.mark.asyncio
+async def test_main_sends_failed_callback_after_same_task_events_finish(monkeypatch):
+    from app import main
+
+    task_id = main.task_manager.create_task({"kml_source": "inline.kml"})
+    event_delivery_started = asyncio.Event()
+    release_event_delivery = asyncio.Event()
+    call_order = []
+
+    class FailedWorkflow:
+        async def execute_workflow(self, _request, progress_callback, execution_event_callback=None):
+            execution_event_callback(
+                ExecutionEvent(
+                    node="trajectory_agent",
+                    phase="failed",
+                    level="error",
+                    message="轨迹分析失败",
+                    progress=15,
+                )
+            )
+            raise RuntimeError("FATAL: invalid trajectory")
+
+    async def blocked_event_delivery(delivery_task_id, _event):
+        assert delivery_task_id == task_id
+        event_delivery_started.set()
+        await release_event_delivery.wait()
+        call_order.append("event")
+        return True
+
+    async def record_callback(**kwargs):
+        call_order.append(kwargs["status"])
+        return True
+
+    monkeypatch.setattr(main, "workflow", FailedWorkflow())
+    monkeypatch.setattr(main.callback_service, "send_execution_event", blocked_event_delivery)
+    monkeypatch.setattr(main.callback_service, "send_callback", record_callback)
+
+    execution = asyncio.create_task(
+        main.execute_analysis_async(task_id, {"kml_source": "inline.kml", "route_id": "route-1"})
+    )
+    await event_delivery_started.wait()
+    await asyncio.sleep(0)
+    assert call_order == []
+
+    release_event_delivery.set()
+    await execution
+
+    assert call_order == ["event", "failed"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_forwards_agent_execution_events():
+    final = valid_result()
+
+    class FakeCompiled:
+        async def astream(self, _state, stream_mode="values"):
+            yield {
+                "current_step": "content_generation",
+                "overall_progress": 65,
+                "execution_events": [
+                    {
+                        "node": "content_agent",
+                        "phase": "llm_completed",
+                        "level": "info",
+                        "message": "LLM 内容生成成功",
+                        "progress": 65,
+                    }
+                ],
+            }
+            yield {
+                "current_step": "aggregate_result",
+                "overall_progress": 100,
+                "execution_events": [],
+                "final_result": final,
+            }
+
+    events = []
+    workflow = AnalysisWorkflow()
+    workflow._compiled = FakeCompiled()
+    await workflow.execute_workflow({}, execution_event_callback=events.append)
+
+    assert any(event["phase"] == "llm_completed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_workflow_ignores_execution_event_callback_failure():
+    final = valid_result()
+
+    class FakeCompiled:
+        async def astream(self, _state, stream_mode="values"):
+            yield {
+                "current_step": "content_generation",
+                "overall_progress": 65,
+                "execution_events": [
+                    {
+                        "node": "content_agent",
+                        "phase": "llm_completed",
+                        "level": "info",
+                        "message": "LLM 内容生成成功",
+                        "progress": 65,
+                    }
+                ],
+            }
+            yield {
+                "current_step": "aggregate_result",
+                "overall_progress": 100,
+                "execution_events": [],
+                "final_result": final,
+            }
+
+    def failed_delivery(_event):
+        raise RuntimeError("WalkBG event endpoint unavailable")
+
+    workflow = AnalysisWorkflow()
+    workflow._compiled = FakeCompiled()
+
+    result = await workflow.execute_workflow(
+        {}, execution_event_callback=failed_delivery
+    )
+
+    assert result["quality_score"] == 80
+
+
+@pytest.mark.asyncio
+async def test_workflow_emits_node_started_before_agent_finishes(monkeypatch):
+    workflow = AnalysisWorkflow()
+    release_agent = asyncio.Event()
+    trajectory_started = asyncio.Event()
+    events = []
+
+    async def blocked_trajectory(_state):
+        await release_agent.wait()
+        return {
+            "errors": ["FATAL: stop after lifecycle assertion"],
+            "current_step": "trajectory_analysis_failed",
+            "overall_progress": 15,
+        }
+
+    async def capture(event):
+        events.append(event)
+        if event["node"] == "analyze_trajectory" and event["phase"] == "started":
+            trajectory_started.set()
+
+    monkeypatch.setattr(workflow.trajectory_agent, "execute", blocked_trajectory)
+    execution = asyncio.create_task(
+        workflow.execute_workflow({}, execution_event_callback=capture)
+    )
+
+    await asyncio.wait_for(trajectory_started.wait(), timeout=0.2)
+    assert not execution.done()
+    release_agent.set()
+    with pytest.raises(RuntimeError):
+        await execution
+    assert any(
+        event["node"] == "analyze_trajectory" and event["phase"] == "completed"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_workflow_emits_safe_terminal_failure_event():
+    class FailedCompiled:
+        async def astream(self, _state, stream_mode="values"):
+            yield {"current_step": "trajectory_analysis", "overall_progress": 15}
+            raise RuntimeError("api_key=sk-secret at http://internal.example/v1")
+
+    events = []
+    workflow = AnalysisWorkflow()
+    workflow._compiled = FailedCompiled()
+
+    with pytest.raises(RuntimeError):
+        await workflow.execute_workflow({}, execution_event_callback=events.append)
+
+    failure = events[-1]
+    serialized = json.dumps(failure, ensure_ascii=False)
+    assert failure["phase"] == "failed"
+    assert failure["level"] == "error"
+    assert "sk-secret" not in serialized
+    assert "internal.example" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_content_fallback_event_does_not_expose_exception_details(monkeypatch):
+    monkeypatch.setattr("app.agents.content_agent.settings.openai_api_key", "test-key")
+    secret_error = RuntimeError(
+        "timeout api_key=sk-secret at https://internal.example/v1 prompt=private"
+    )
+    llm = SimpleNamespace(ainvoke=AsyncMock(side_effect=secret_error))
+    monkeypatch.setattr("app.agents.content_agent.get_llm", lambda: llm)
+
+    update = await ContentAgent().execute(base_state())
+    serialized = json.dumps(update["execution_events"], ensure_ascii=False)
+
+    assert update["execution_events"][0]["details"]["error_category"] == "timeout"
+    assert "sk-secret" not in serialized
+    assert "internal.example" not in serialized
+    assert "private" not in serialized

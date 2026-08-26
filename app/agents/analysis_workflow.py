@@ -31,11 +31,13 @@ KML 分析工作流 (Analysis Workflow)
 
 import inspect
 import logging
+from contextvars import ContextVar
 from typing import Any, Awaitable, Callable, Dict, Optional, Union
 from datetime import datetime
 
 from langgraph.graph import StateGraph, END
 
+from app.models.execution_event import build_execution_event, classify_safe_error
 from app.models.state import AgentState
 from app.models.response import EnhancedRouteOutput
 from app.agents.base import BaseAgent, create_initial_state
@@ -47,6 +49,11 @@ from app.agents.quality_agent import QualityAgent
 from app.agents.segment_merge_agent import SegmentMergeAgent
 
 logger = logging.getLogger(__name__)
+
+ExecutionEventCallback = Callable[[Dict[str, Any]], Union[None, Awaitable[None]]]
+_execution_event_callback: ContextVar[Optional[ExecutionEventCallback]] = ContextVar(
+    "execution_event_callback", default=None
+)
 
 
 class AnalysisWorkflow(BaseAgent):
@@ -95,15 +102,36 @@ class AnalysisWorkflow(BaseAgent):
         """
         graph = StateGraph(AgentState)
         
-        # 添加节点
-        graph.add_node("init", self._init_node)
-        graph.add_node("analyze_trajectory", self._analyze_trajectory_node)
-        graph.add_node("segment_route", self._segment_route_node)
-        graph.add_node("merge_segments", self._merge_segments_node)
-        graph.add_node("recognize_poi", self._recognize_poi_node)
-        graph.add_node("generate_content", self._generate_content_node)
-        graph.add_node("assess_quality", self._assess_quality_node)
-        graph.add_node("aggregate_result", self._aggregate_result_node)
+        # 添加节点；生命周期包装器确保 started 在节点实际执行前发出。
+        graph.add_node("init", self._with_lifecycle("init", self._init_node, 0))
+        graph.add_node(
+            "analyze_trajectory",
+            self._with_lifecycle("analyze_trajectory", self._analyze_trajectory_node, 5),
+        )
+        graph.add_node(
+            "segment_route",
+            self._with_lifecycle("segment_route", self._segment_route_node, 15),
+        )
+        graph.add_node(
+            "merge_segments",
+            self._with_lifecycle("merge_segments", self._merge_segments_node, 30),
+        )
+        graph.add_node(
+            "recognize_poi",
+            self._with_lifecycle("recognize_poi", self._recognize_poi_node, 35),
+        )
+        graph.add_node(
+            "generate_content",
+            self._with_lifecycle("generate_content", self._generate_content_node, 50),
+        )
+        graph.add_node(
+            "assess_quality",
+            self._with_lifecycle("assess_quality", self._assess_quality_node, 65),
+        )
+        graph.add_node(
+            "aggregate_result",
+            self._with_lifecycle("aggregate_result", self._aggregate_result_node, 85),
+        )
         
         # 设置入口点
         graph.set_entry_point("init")
@@ -146,6 +174,60 @@ class AnalysisWorkflow(BaseAgent):
         graph.add_edge("aggregate_result", END)
         
         return graph
+
+    @staticmethod
+    async def _emit_execution_event(event: Dict[str, Any]) -> None:
+        callback = _execution_event_callback.get()
+        if callback is None:
+            return
+        try:
+            callback_result = callback(event)
+            if inspect.isawaitable(callback_result):
+                await callback_result
+        except Exception as exc:
+            logger.warning(
+                "执行事件回调失败，分析继续: node=%s, phase=%s, error_type=%s",
+                event.get("node", "unknown"),
+                event.get("phase", "unknown"),
+                type(exc).__name__,
+            )
+
+    def _with_lifecycle(
+        self,
+        node: str,
+        handler: Callable[[AgentState], Awaitable[AgentState]],
+        start_progress: int,
+    ) -> Callable[[AgentState], Awaitable[AgentState]]:
+        async def wrapped(state: AgentState) -> AgentState:
+            await self._emit_execution_event(build_execution_event(
+                node=node,
+                phase="started",
+                level="info",
+                message=f"开始执行步骤 {node}",
+                progress=start_progress,
+            ))
+            try:
+                update = await handler(state)
+            except Exception as exc:
+                await self._emit_execution_event(build_execution_event(
+                    node=node,
+                    phase="failed",
+                    level="error",
+                    message=f"步骤 {node} 执行失败",
+                    progress=start_progress,
+                    details=classify_safe_error(exc),
+                ))
+                raise
+            await self._emit_execution_event(build_execution_event(
+                node=node,
+                phase="completed",
+                level="info",
+                message=f"步骤 {node} 执行完成",
+                progress=int(update.get("overall_progress", start_progress)),
+            ))
+            return update
+
+        return wrapped
     
     # ========================================
     # 工作流节点实现
@@ -434,6 +516,10 @@ class AnalysisWorkflow(BaseAgent):
             "generated_difficulties": generated_content.get("difficulties", []),
             "generated_safety_notes": generated_content.get("safety_notes", []),
             "equipment_recommendations": generated_content.get("equipment_recommendations", []),
+            "generation_mode": generated_content.get("generation_mode") or (
+                "disabled" if not request.get("enable_content_generation", True) else None
+            ),
+            "degraded": bool(state.get("degraded", False)),
             
             # 警告
             "warnings": [
@@ -473,29 +559,51 @@ class AnalysisWorkflow(BaseAgent):
         progress_callback: Optional[
             Callable[[str, int], Union[None, Awaitable[None]]]
         ] = None,
+        execution_event_callback: Optional[ExecutionEventCallback] = None,
     ) -> Dict[str, Any]:
-        """执行工作流，并在每个已完成节点后报告单调进度。"""
+        """执行工作流，并报告单调进度、节点生命周期和 Agent 事件。"""
         self.log_start()
         initial_state = create_initial_state(request_dict)
         final_state: Dict[str, Any] = initial_state
         last_progress = 0
+        emitted_event_count = 0
+        callback_token = _execution_event_callback.set(execution_event_callback)
 
         logger.info("开始执行工作流")
-        async for state in self._compiled.astream(initial_state, stream_mode="values"):
-            final_state = state
-            progress = max(last_progress, int(state.get("overall_progress", 0)))
-            step = state.get("current_step", "unknown")
-            if progress_callback is not None and progress > last_progress and progress > 0:
-                callback_result = progress_callback(step, progress)
-                if inspect.isawaitable(callback_result):
-                    await callback_result
-            last_progress = progress
+        try:
+            async for state in self._compiled.astream(initial_state, stream_mode="values"):
+                final_state = state
+                progress = max(last_progress, int(state.get("overall_progress", 0)))
+                step = state.get("current_step", "unknown")
 
-        result = final_state.get("final_result")
-        if result is None:
-            errors = final_state.get("errors") or ["工作流未生成最终结果"]
-            raise RuntimeError("; ".join(str(error) for error in errors))
+                state_events = state.get("execution_events", [])
+                for event in state_events[emitted_event_count:]:
+                    await self._emit_execution_event(event)
+                emitted_event_count = len(state_events)
 
-        validated = EnhancedRouteOutput.model_validate(result).model_dump(mode="json")
-        self.log_complete()
-        return validated
+                if progress_callback is not None and progress > last_progress and progress > 0:
+                    callback_result = progress_callback(step, progress)
+                    if inspect.isawaitable(callback_result):
+                        await callback_result
+                last_progress = progress
+
+            result = final_state.get("final_result")
+            if result is None:
+                errors = final_state.get("errors") or ["工作流未生成最终结果"]
+                raise RuntimeError("; ".join(str(error) for error in errors))
+
+            validated = EnhancedRouteOutput.model_validate(result).model_dump(mode="json")
+            self.log_complete()
+            return validated
+        except Exception as exc:
+            await self._emit_execution_event(build_execution_event(
+                node=final_state.get("current_step", "analysis_workflow"),
+                phase="failed",
+                level="error",
+                message="分析工作流执行失败",
+                progress=last_progress,
+                details=classify_safe_error(exc),
+            ))
+            raise
+        finally:
+            _execution_event_callback.reset(callback_token)

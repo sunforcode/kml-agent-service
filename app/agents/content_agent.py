@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.agents.base import BaseAgent
 from app.core.config import settings
 from app.core.llm import get_llm
+from app.models.execution_event import build_execution_event, classify_safe_error
 
 logger = logging.getLogger(__name__)
 
@@ -48,17 +49,39 @@ class ContentAgent(BaseAgent):
                 "generated_content": content,
                 "current_step": "content_generation",
                 "overall_progress": 65,
+                "execution_events": [build_execution_event(
+                    node=self.name,
+                    phase="llm_completed",
+                    level="info",
+                    message="LLM 内容生成成功",
+                    progress=65,
+                    details={"generation_mode": "llm"},
+                )],
+                "degraded": False,
+                "generation_modes": {self.name: "llm"},
             }
         except Exception as exc:
             logger.warning("内容生成降级为确定性模板: %s", exc)
+            safe_error = classify_safe_error(exc)
             return {
                 "generated_content": self._fallback_content(state),
                 "current_step": "content_generation",
                 "overall_progress": 65,
                 "warnings": [{
                     "level": "warning",
-                    "message": f"内容生成降级为确定性模板: {exc}",
+                    "message": "内容生成降级为确定性模板",
+                    "detail": safe_error["summary"],
                 }],
+                "execution_events": [build_execution_event(
+                    node=self.name,
+                    phase="degraded",
+                    level="warning",
+                    message="内容生成已降级为确定性模板",
+                    progress=65,
+                    details=safe_error,
+                )],
+                "degraded": True,
+                "generation_modes": {self.name: "fallback"},
             }
 
     def _messages(self, state: Dict[str, Any]) -> List[Any]:
