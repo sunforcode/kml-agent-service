@@ -32,7 +32,7 @@ KML 分析工作流 (Analysis Workflow)
 import inspect
 import logging
 from contextvars import ContextVar
-from typing import Any, Awaitable, Callable, Dict, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 from datetime import datetime
 
 from langgraph.graph import StateGraph, END
@@ -471,7 +471,7 @@ class AnalysisWorkflow(BaseAgent):
         if distance_km >= 5 or elevation_gain >= 300:
             return 2
         return 1
-    
+
     def _build_final_result(self, state: AgentState) -> Dict[str, Any]:
         """
         构建最终结果
@@ -488,7 +488,8 @@ class AnalysisWorkflow(BaseAgent):
         warnings = state.get("warnings", [])
         errors = state.get("errors", [])
         request = state.get("request", {})
-        
+        track_points = state.get("track_points", [])
+
         return {
             # 元数据
             "source_kml_url": state.get("request", {}).get("kml_source", ""),
@@ -509,6 +510,17 @@ class AnalysisWorkflow(BaseAgent):
             # 多方案分段 + 统一 POI
             "segment_schemes": segment_schemes,
             "poi_points": poi_points,
+
+            # 完整轨迹路径（索引与分段 track_start/end_index 对齐，供后端精确渲染）
+            # 注意：轨迹点经 LangGraph 状态传递后可能是 dict 或 pydantic 对象，需兼容
+            "track_path": [
+                (
+                    [p["latitude"], p["longitude"], p.get("elevation")]
+                    if isinstance(p, dict)
+                    else [p.latitude, p.longitude, p.elevation]
+                )
+                for p in track_points
+            ],
 
             # 生成内容
             "generated_description": generated_content.get("description"),

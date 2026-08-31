@@ -103,122 +103,26 @@ class TrackProcessor:
     def parse_kml_or_gpx(self, content: str, file_type: str = "kml") -> List[TrackPoint]:
         """
         解析 KML 或 GPX 文件
-        
+
+        已重构为适配器架构：各格式适配器见 app/core/parsers/，
+        本方法仅作为兼容入口，统一委托给适配器注册表。
+
         Args:
             content: 文件内容字符串
             file_type: "kml" 或 "gpx"
-            
+
         Returns:
-            TrackPoint 列表
+            TrackPoint 列表（标准轨迹数据）
         """
-        points = []
-        
-        if file_type.lower() == "gpx":
-            gpx = gpxpy.parse(content)
-            cumulative_distance = 0.0
-            
-            # 全局距离跨 segment 累计，但 segment 首点不连接上一段末点。
-            segment_index = 0
-            for track in gpx.tracks:
-                for segment in track.segments:
-                    prev_point = None
-                    
-                    for p in segment.points:
-                        if prev_point:
-                            # geopy 计算距离（比自己实现更准确）
-                            cumulative_distance += geodesic(
-                                (prev_point.latitude, prev_point.longitude),
-                                (p.latitude, p.longitude)
-                            ).km
-                        
-                        point = TrackPoint(
-                            latitude=p.latitude,
-                            longitude=p.longitude,
-                            elevation=p.elevation,
-                            timestamp=p.time,
-                            distance_from_start=cumulative_distance,
-                            segment_index=segment_index,
-                        )
-                        points.append(point)
-                        prev_point = p
-                    segment_index += 1
-            
-            # 还可以提取 waypoints
-            # for wp in gpx.waypoints:
-            #     ...
-            
-        elif file_type.lower() == "kml":
-            from xml.etree import ElementTree as ET
+        # 延迟导入避免循环依赖（适配器需要引用本模块的 TrackPoint）
+        from app.core.parsers import parse_track
 
-            # 命名空间处理
-            ns = {
-                "kml": "http://www.opengis.net/kml/2.2",
-                "gx": "http://www.google.com/kml/ext/2.2",
-            }
-
-            root = ET.fromstring(content)
-
-            cumulative_distance = 0.0
-            prev_lat_lon = None
-
-            def _append_point(lat, lon, elev, segment_index):
-                nonlocal cumulative_distance, prev_lat_lon
-                if prev_lat_lon:
-                    cumulative_distance += geodesic(prev_lat_lon, (lat, lon)).km
-                points.append(TrackPoint(
-                    latitude=lat,
-                    longitude=lon,
-                    elevation=elev,
-                    distance_from_start=cumulative_distance,
-                    segment_index=segment_index,
-                ))
-                prev_lat_lon = (lat, lon)
-
-            # 方案 1： gx:Track / gx:MultiTrack （两步路、奥维等 App 导出格式）
-            # 每条 gx:Track 是独立线段，首点不连接上一条 track 的末点。
-            gx_tracks = root.findall(".//gx:Track", ns)
-            if gx_tracks:
-                for segment_index, track in enumerate(gx_tracks):
-                    prev_lat_lon = None
-                    for elem in track.findall("gx:coord", ns):
-                        if elem.text:
-                            parts = elem.text.strip().split()
-                            if len(parts) >= 2:
-                                try:
-                                    lon = float(parts[0])
-                                    lat = float(parts[1])
-                                    elev = float(parts[2]) if len(parts) > 2 else None
-                                    _append_point(lat, lon, elev, segment_index)
-                                except (ValueError, IndexError):
-                                    continue
-
-            # 方案 2： 普通 LineString / MultiGeometry 中的 <coordinates>
-            # 格式： lng,lat,elev (逗号分隔，多个点用空白分隔)
-            if not points:
-                segment_index = 0
-                for coords_elem in root.findall(".//kml:coordinates", ns):
-                    if coords_elem.text:
-                        # 每个 coordinates 元素是独立线段，不连接上一条线的末点。
-                        prev_lat_lon = None
-                        # 过滤出单点 Placemark （包含换行），只保留多点线段
-                        coord_text = coords_elem.text.strip()
-                        coord_lines = [l for l in coord_text.split() if "," in l]
-                        if len(coord_lines) < 2:
-                            continue  # 单点 Placemark，跳过
-                        for line in coord_lines:
-                            parts = line.split(",")
-                            if len(parts) >= 2:
-                                try:
-                                    lon = float(parts[0])
-                                    lat = float(parts[1])
-                                    elev = float(parts[2]) if len(parts) > 2 else None
-                                    _append_point(lat, lon, elev, segment_index)
-                                except (ValueError, IndexError):
-                                    continue
-                        segment_index += 1
-
-        return points
-
+        file_type = (file_type or "").strip().lower() or None
+        try:
+            return parse_track(content, file_type)
+        except ValueError:
+            # 格式名无法识别时按内容自动探测
+            return parse_track(content, None)
     # ============================================
     # 2. 数据清洗与平滑 - 使用 scipy
     # ============================================

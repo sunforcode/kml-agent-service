@@ -4,7 +4,7 @@ KML Agent Service - 请求数据模型
 """
 
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from enum import IntEnum
 
 
@@ -15,6 +15,87 @@ class RouteDifficulty(IntEnum):
     HARD = 3
     VERY_HARD = 4
     EXTREME = 5
+
+
+class PoiFilterItem(BaseModel):
+    """待筛选的 POI 条目"""
+
+    name: str
+    """POI 名称"""
+
+    category: str = ""
+    """当前类别（可选，如 water/camp/supply/photo/pass 等）"""
+
+    latitude: float
+    longitude: float
+    elevation: Optional[float] = None
+    """海拔（米，可选）"""
+
+    description: Optional[str] = None
+    """描述（可选，截断后送入 LLM）"""
+
+
+class PoiFilterRequest(BaseModel):
+    """POI LLM 筛选请求"""
+
+    route_id: Optional[str] = None
+    """关联路线 ID（可选，仅用于日志）"""
+
+    pois: List[PoiFilterItem]
+    """待筛选的 POI 列表"""
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "route_id": "route_1788106618095_DNukEfsb",
+                "pois": [
+                    {
+                        "name": "东台望海峰",
+                        "category": "pass",
+                        "latitude": 39.0817,
+                        "longitude": 113.6534,
+                        "elevation": 2795.0,
+                        "description": None
+                    }
+                ]
+            }
+        }
+    }
+
+
+class PoiResolvePoi(BaseModel):
+    """待判定的路线 POI"""
+
+    name: str
+    latitude: float
+    longitude: float
+    elevation: Optional[float] = None
+    exclude_id: Optional[str] = None
+    """召回候选时排除的库条目 id（批内互判场景下用于排除自身）"""
+
+
+class PoiResolveLibraryItem(BaseModel):
+    """库内候选条目"""
+
+    id: str
+    name: str
+    latitude: float
+    longitude: float
+    category: Optional[str] = None
+    elevation: Optional[float] = None
+
+
+class PoiResolveRequest(BaseModel):
+    """POI 位置合并 AI 判定请求"""
+
+    route_id: Optional[str] = None
+    """关联路线 ID（可选，仅用于日志）"""
+
+    pois: List[PoiResolvePoi]
+    """待判定的新 POI 列表"""
+
+    library: List[PoiResolveLibraryItem]
+    """同地区的库内条目（由调用方过滤，agent 内部再做距离召回）"""
 
 
 class KmlAnalysisRequest(BaseModel):

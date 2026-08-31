@@ -32,14 +32,25 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.core.config import settings
-from app.models.request import KmlAnalysisRequest
+from app.models.request import (
+    KmlAnalysisRequest,
+    PoiFilterRequest,
+    PoiFilterItem,
+    PoiResolveRequest,
+)
 from app.models.response import (
     TaskSubmitResponse,
     TaskStatusResponse,
-    HealthResponse
+    HealthResponse,
+    POIFilterResponse,
+    POIFilterResultItem,
+    POIResolveResponse,
+    POIResolveResultItem,
 )
 from app.services.task_service import task_manager, TaskStatus
 from app.services.callback_service import callback_service
+from app.services.poi_filter_service import filter_pois_by_llm
+from app.services.poi_match_service import resolve_poi_matches
 from app.agents.analysis_workflow import AnalysisWorkflow
 
 # 配置日志
@@ -200,6 +211,108 @@ async def submit_analysis(
         status="pending",
         message="分析任务已提交，正在执行中",
         estimated_seconds=60
+    )
+
+
+# ========================================
+# POI 筛选端点
+# ========================================
+
+@app.post("/api/v1/pois/filter", response_model=POIFilterResponse)
+async def filter_pois(request: PoiFilterRequest):
+    """
+    用 LLM 对 POI 列表做质量筛选
+
+    逐个判断 POI 是否与徒步相关（保留/剔除）、规范化类别，并给出理由。
+    同步返回（内部按 30 个一批调用 LLM），大列表耗时可能较长。
+
+    示例:
+        POST /api/v1/pois/filter
+        {
+            "route_id": "route_xxx",
+            "pois": [
+                {"name": "东台望海峰", "category": "pass", "latitude": 39.08, "longitude": 113.65, "elevation": 2795}
+            ]
+        }
+    """
+    logger.info(f"收到 POI 筛选请求: route_id={request.route_id}, 数量={len(request.pois)}")
+
+    if not request.pois:
+        return POIFilterResponse(total=0, keep_count=0, reject_count=0, results=[])
+
+    judgements, degraded = await filter_pois_by_llm(request.pois)
+
+    results: list[POIFilterResultItem] = []
+    keep_count = 0
+    reject_count = 0
+    for poi, judge in zip(request.pois, judgements):
+        if judge["action"] == "keep":
+            keep_count += 1
+        else:
+            reject_count += 1
+        results.append(
+            POIFilterResultItem(
+                index=judge["index"],
+                name=poi.name,
+                latitude=poi.latitude,
+                longitude=poi.longitude,
+                elevation=poi.elevation,
+                action=judge["action"],
+                category=judge["category"] or poi.category,
+                original_category=poi.category or None,
+                reason=judge["reason"],
+            )
+        )
+
+    logger.info(
+        f"POI 筛选完成: route_id={request.route_id}, "
+        f"总数={len(results)}, 保留={keep_count}, 剔除={reject_count}, degraded={degraded}"
+    )
+    return POIFilterResponse(
+        total=len(results),
+        keep_count=keep_count,
+        reject_count=reject_count,
+        results=results,
+        degraded=degraded,
+    )
+
+
+@app.post("/api/v1/pois/resolve", response_model=POIResolveResponse)
+async def resolve_pois(request: PoiResolveRequest):
+    """
+    用 LLM 判定新 POI 与库内条目是否为同一位置
+
+    代码不写合并策略：只做候选召回（同库内距离 500m 内，最多 5 个），
+    是否合并/命中由 LLM 依据坐标、海拔、名称参考综合判定。
+    LLM 失败时保守回退为不命中（degraded=True）。
+    """
+    logger.info(
+        f"收到 POI 位置判定请求: route_id={request.route_id}, "
+        f"pois={len(request.pois)}, library={len(request.library)}"
+    )
+
+    if not request.pois:
+        return POIResolveResponse(total=0, matched_count=0, results=[])
+
+    pois = [p.model_dump() for p in request.pois]
+    library = [item.model_dump() for item in request.library]
+
+    judgements, degraded = await resolve_poi_matches(pois, library)
+
+    results = [
+        POIResolveResultItem(
+            index=j["index"], library_id=j.get("library_id"), reason=j.get("reason", "")
+        )
+        for j in judgements
+    ]
+    matched_count = sum(1 for r in results if r.library_id)
+
+    logger.info(
+        f"POI 位置判定完成: route_id={request.route_id}, "
+        f"总数={len(results)}, 命中={matched_count}, degraded={degraded}"
+    )
+    return POIResolveResponse(
+        total=len(results), matched_count=matched_count, results=results, degraded=degraded
     )
 
 

@@ -274,6 +274,7 @@ class CallbackService:
             "estimated_difficulty": result.get("estimated_difficulty"),
             "segment_schemes": segment_schemes,
             "poi_points": poi_points,
+            "track_path": result.get("track_path", []),
             "generated_description": result.get("generated_description"),
             "generated_highlights": result.get("generated_highlights", []),
             "generated_difficulties": result.get("generated_difficulties", []),

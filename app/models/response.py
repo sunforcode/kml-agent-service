@@ -368,6 +368,9 @@ class EnhancedRouteOutput(BaseModel):
 
     poi_points: List[POIOutput]
     """统一 POI 列表"""
+
+    track_path: List[List[Optional[float]]] = []
+    """完整轨迹路径，紧凑格式 [[lat, lng, elev], ...]，顺序即分段 track_start/end_index 的索引"""
     
     # ========================================
     # 生成内容（可选）
@@ -406,3 +409,71 @@ class EnhancedRouteOutput(BaseModel):
     """原始分析数据（可选）"""
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+
+class POIFilterResultItem(BaseModel):
+    """POI 筛选结果单条"""
+
+    index: int
+    """对应输入列表下标"""
+
+    name: str = ""
+    """POI 名称（回显）"""
+
+    latitude: float = 0.0
+    longitude: float = 0.0
+    elevation: Optional[float] = None
+
+    action: Literal["keep", "reject"] = "keep"
+    """keep=保留 / reject=建议剔除"""
+
+    category: str = ""
+    """规范化后的类别"""
+
+    original_category: Optional[str] = None
+    """原始类别（便于前端展示变更）"""
+
+    reason: str = ""
+    """LLM 判断理由"""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class POIResolveResultItem(BaseModel):
+    """POI 位置判定结果单条"""
+
+    index: int
+    """对应输入 pois 列表下标"""
+
+    library_id: Optional[str] = None
+    """判命中的库条目 id，未命中为 null"""
+
+    reason: str = ""
+    """LLM 判定理由"""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class POIResolveResponse(BaseModel):
+    """POI 位置合并 AI 判定响应"""
+
+    total: int = 0
+    matched_count: int = 0
+    results: List[POIResolveResultItem] = []
+    degraded: bool = False
+    """任一批因 LLM 失败而保守不合并时为 True"""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class POIFilterResponse(BaseModel):
+    """POI LLM 筛选响应"""
+
+    total: int = 0
+    keep_count: int = 0
+    reject_count: int = 0
+    results: List[POIFilterResultItem] = []
+    degraded: bool = False
+    """任一 POI 因 LLM 失败而默认保留时为 True"""
+
+    model_config = ConfigDict(extra="forbid")

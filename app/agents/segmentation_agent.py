@@ -42,6 +42,12 @@ from app.core.track_processor import (
 
 logger = logging.getLogger(__name__)
 
+# 按天方案日配色（每天专属颜色，便于地图上区分）
+DAY_COLORS = [
+    "#E91E63", "#3F51B5", "#009688", "#FF9800", "#795548",
+    "#673AB7", "#00BCD4", "#8BC34A", "#F44336", "#607D8B",
+]
+
 
 class SegmentationStrategy(str, Enum):
     TIME = "time"           # 仅按时间间隔
@@ -187,6 +193,7 @@ class SegmentationAgent(BaseAgent):
                 self.time_gap_hours = float(request["time_gap_hours"])
             except (ValueError, TypeError):
                 pass
+
         
         if "min_segment_distance_km" in request:
             try:
@@ -212,21 +219,12 @@ class SegmentationAgent(BaseAgent):
             timestamp = None
             ts_str = d.get("timestamp")
             if ts_str:
-                try:
-                    if isinstance(ts_str, str):
-                        # 尝试常见格式
-                        for fmt in [
-                            "%Y-%m-%dT%H:%M:%S.%f",
-                            "%Y-%m-%dT%H:%M:%S",
-                            "%Y-%m-%d %H:%M:%S"
-                        ]:
-                            try:
-                                timestamp = datetime.strptime(ts_str, fmt)
-                                break
-                            except ValueError:
-                                continue
-                except Exception:
-                    pass
+                if isinstance(ts_str, str):
+                    # 统一走适配器层的时间解析（兼容 Z / +00:00 / 无时区等写法）
+                    from app.core.parsers.base import parse_iso_datetime
+                    timestamp = parse_iso_datetime(ts_str)
+                elif hasattr(ts_str, "year"):
+                    timestamp = ts_str  # 已是 datetime 对象
             
             # AgentState 统一使用米，track_processor 内部使用公里。
             distance_km = d.get("distance_from_start", 0.0) / 1000.0
@@ -658,16 +656,17 @@ class SegmentationAgent(BaseAgent):
         """
         基于时间间隔计算按天分段列表
 
-        过滤条件：轨迹点必须有时间戳，否则返回空列表。
-        分天逐辑：相邻两点时间间隔 > time_gap_hours 就新开一天。
+        过滤条件：轨迹点必须有时间戳，否则返回空列表（无法判断）。
+        分天逻辑：相邻两点时间间隔 > time_gap_hours 就新开一天。
         """
         # 如果没有时间戳，返回空列表
         has_timestamps = any(p.timestamp is not None for p in points)
         if not has_timestamps:
-            logger.info("SegmentationAgent: 轨迹无时间戳，按天方案 segments 为空")
+            logger.info("SegmentationAgent: 轨迹无时间戳，无法按天判断，按天方案 segments 为空")
             return []
 
         # 分天逻辑
+
         gap_threshold_seconds = self.time_gap_hours * 3600
         day_groups: List[List[int]] = [[0]]  # 第一天从第0个点开始
 
@@ -715,7 +714,7 @@ class SegmentationAgent(BaseAgent):
                 "id": seg_id,
                 "name": f"第{day_idx + 1}天",
                 "sequence_number": day_idx + 1,
-                "color": "#607D8B",  # 按天统一用灯笼蓝
+                "color": DAY_COLORS[day_idx % len(DAY_COLORS)],  # 每天专属配色，便于地图区分
                 "distance": round(total_dist, 2),
                 "elevation_gain": round(total_gain, 1),
                 "elevation_loss": round(total_loss, 1),
