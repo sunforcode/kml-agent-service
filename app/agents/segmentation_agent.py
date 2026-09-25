@@ -658,6 +658,7 @@ class SegmentationAgent(BaseAgent):
 
         过滤条件：轨迹点必须有时间戳，否则返回空列表（无法判断）。
         分天逻辑：相邻两点时间间隔 > time_gap_hours 就新开一天。
+        原始轨迹断段只限制统计计算，不代表新的一天。
         """
         # 如果没有时间戳，返回空列表
         has_timestamps = any(p.timestamp is not None for p in points)
@@ -673,12 +674,11 @@ class SegmentationAgent(BaseAgent):
         for i in range(1, len(points)):
             prev = points[i - 1]
             curr = points[i]
-            starts_new_source_segment = curr.segment_index != prev.segment_index
             exceeds_time_gap = False
             if prev.timestamp and curr.timestamp:
                 diff = (curr.timestamp - prev.timestamp).total_seconds()
                 exceeds_time_gap = diff > gap_threshold_seconds
-            if starts_new_source_segment or exceeds_time_gap:
+            if exceeds_time_gap:
                 day_groups.append([])
             day_groups[-1].append(i)
 
@@ -696,18 +696,19 @@ class SegmentationAgent(BaseAgent):
             sp = points[start_i]
             ep = points[end_i]
 
-            # 简单计算距离
-            total_dist = (points[end_i].distance_from_start or 0) - (points[start_i].distance_from_start or 0)
-            total_gain = sum(
-                max(0, points[j].elevation - points[j - 1].elevation)
-                for j in range(start_i + 1, end_i + 1)
-                if points[j].elevation is not None and points[j - 1].elevation is not None
-            )
-            total_loss = sum(
-                max(0, points[j - 1].elevation - points[j].elevation)
-                for j in range(start_i + 1, end_i + 1)
-                if points[j].elevation is not None and points[j - 1].elevation is not None
-            )
+            # 同一天可包含多段录制；距离和高差仍禁止跨原始断段累计。
+            day_points = points[start_i:end_i + 1]
+            total_dist = self._calculate_walkable_distance(day_points)
+            total_gain = 0.0
+            total_loss = 0.0
+            for previous, current in zip(day_points, day_points[1:]):
+                if current.segment_index != previous.segment_index:
+                    continue
+                if current.elevation is None or previous.elevation is None:
+                    continue
+                elevation_change = current.elevation - previous.elevation
+                total_gain += max(0, elevation_change)
+                total_loss += max(0, -elevation_change)
 
             seg_id = f"day_{day_idx + 1:02d}"
             day_segment_list.append({

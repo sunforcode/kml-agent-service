@@ -860,7 +860,7 @@ async def test_disconnected_singleton_gpx_segments_are_fatal_in_full_workflow():
 
 
 @pytest.mark.asyncio
-async def test_multi_track_segments_keep_slope_and_day_calculations_within_source_boundaries():
+async def test_multi_track_segments_keep_slope_boundaries_without_inventing_days():
     points = [
         {
             "latitude": 30.0,
@@ -899,11 +899,10 @@ async def test_multi_track_segments_keep_slope_and_day_calculations_within_sourc
     update = await SegmentationAgent().execute({"request": {}, "track_points": points})
     source_segment_indexes = [point["segment_index"] for point in points]
 
-    for scheme in update["segment_schemes"][:2]:
-        for segment in scheme["segments"]:
-            start = segment["track_start_index"]
-            end = segment["track_end_index"]
-            assert source_segment_indexes[start] == source_segment_indexes[end]
+    for segment in update["segment_schemes"][0]["segments"]:
+        start = segment["track_start_index"]
+        end = segment["track_end_index"]
+        assert source_segment_indexes[start] == source_segment_indexes[end]
 
     slope_segments = update["segment_schemes"][0]["segments"]
     assert [(segment["track_start_index"], segment["track_end_index"]) for segment in slope_segments] == [
@@ -914,9 +913,7 @@ async def test_multi_track_segments_keep_slope_and_day_calculations_within_sourc
     assert sum(segment["elevation_loss"] for segment in slope_segments) == pytest.approx(10.0)
 
     day_segments = update["segment_schemes"][1]["segments"]
-    assert day_segments
-    assert sum(segment["elevation_gain"] for segment in day_segments) == pytest.approx(10.0)
-    assert sum(segment["elevation_loss"] for segment in day_segments) == pytest.approx(10.0)
+    assert day_segments == []
 
 
 @pytest.mark.asyncio
