@@ -3,7 +3,7 @@ KML Agent Service - 请求数据模型
 定义API请求的Pydantic模型
 """
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from enum import IntEnum
 
@@ -104,7 +104,10 @@ class KmlAnalysisRequest(BaseModel):
     
     后端(walkbg)调用POST /api/v1/analyze时使用此模型
     """
-    
+
+    task_id: Optional[str] = Field(default=None, min_length=1, max_length=64, pattern=r"\S")
+    """后端预分配任务身份；省略时由服务生成，仅保证当前进程内复用"""
+
     route_id: Optional[str] = None
     """关联的walkbg路线ID（可选）"""
     

@@ -16,7 +16,9 @@ import json
 import logging
 import math
 import uuid
+from copy import deepcopy
 from datetime import datetime
+from threading import Lock
 from typing import Dict, Any, Optional, List
 from enum import Enum
 
@@ -41,44 +43,55 @@ class TaskManager:
     def __init__(self):
         # 内存存储（MVP阶段使用）
         self._tasks: Dict[str, Dict[str, Any]] = {}
-    
+        self._submission_lock = Lock()
+
     def create_task(
         self,
         request: Dict[str, Any],
         estimated_seconds: int = 60
     ) -> str:
-        """
-        创建新任务
-        
-        Args:
-            request: 分析请求
-            estimated_seconds: 预估完成时间（秒）
-            
-        Returns:
-            task_id: 任务ID
-        """
-        task_id = f"task_{uuid.uuid4().hex[:12]}"
-        
-        task_data = {
-            "task_id": task_id,
-            "request": request,
-            "status": TaskStatus.PENDING,
-            "progress": 0,
-            "current_step": "pending",
-            "message": "任务已创建，等待执行",
-            "result": None,
-            "error": None,
-            "created_at": datetime.utcnow().isoformat(),
-            "started_at": None,
-            "completed_at": None,
-            "estimated_seconds": estimated_seconds
-        }
-        
-        self._tasks[task_id] = task_data
-        logger.info(f"创建任务: {task_id}")
-        
+        """兼容既有调用方；有预分配身份时复用同请求任务。"""
+        task_id, _ = self.get_or_create_task(request, estimated_seconds)
         return task_id
-    
+
+    def get_or_create_task(
+        self,
+        request: Dict[str, Any],
+        estimated_seconds: int = 60
+    ) -> tuple[str, bool]:
+        """原子登记任务，返回身份及是否需要调度；不是跨进程执行保证。"""
+        snapshot = deepcopy(request)
+        requested_id = snapshot.get("task_id")
+        if requested_id is not None and (
+            not isinstance(requested_id, str) or not requested_id.strip() or len(requested_id) > 64
+        ):
+            raise ValueError("task_id 必须是非空且不超过64字符的字符串")
+
+        with self._submission_lock:
+            task_id = requested_id or f"task_{uuid.uuid4().hex[:12]}"
+            existing = self._tasks.get(task_id)
+            if existing is not None:
+                if existing["request"] != snapshot:
+                    raise ValueError("task_id 已绑定不同的分析请求")
+                return task_id, False
+
+            self._tasks[task_id] = {
+                "task_id": task_id,
+                "request": snapshot,
+                "status": TaskStatus.PENDING,
+                "progress": 0,
+                "current_step": "pending",
+                "message": "任务已创建，等待执行",
+                "result": None,
+                "error": None,
+                "created_at": datetime.utcnow().isoformat(),
+                "started_at": None,
+                "completed_at": None,
+                "estimated_seconds": estimated_seconds
+            }
+            logger.info(f"创建任务: {task_id}")
+            return task_id, True
+
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         """
         获取任务信息
@@ -217,17 +230,21 @@ class TaskManager:
         """
         now = datetime.utcnow()
         tasks_to_remove = []
-        
-        for task_id, task in self._tasks.items():
-            created_at = datetime.fromisoformat(task["created_at"])
-            age_hours = (now - created_at).total_seconds() / 3600
-            
-            if age_hours > max_age_hours:
-                tasks_to_remove.append(task_id)
-        
-        for task_id in tasks_to_remove:
-            del self._tasks[task_id]
-        
+
+        with self._submission_lock:
+            for task_id, task in self._tasks.items():
+                # 预分配身份保留到进程退出，清理不能重新开放同ID执行资格。
+                if task["request"].get("task_id") is not None:
+                    continue
+                created_at = datetime.fromisoformat(task["created_at"])
+                age_hours = (now - created_at).total_seconds() / 3600
+
+                if age_hours > max_age_hours:
+                    tasks_to_remove.append(task_id)
+
+            for task_id in tasks_to_remove:
+                del self._tasks[task_id]
+
         if tasks_to_remove:
             logger.info(f"清理过期任务: {len(tasks_to_remove)}个")
         

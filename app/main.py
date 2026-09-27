@@ -191,26 +191,27 @@ async def submit_analysis(
             detail="服务未就绪，请稍后重试"
         )
     
-    # 创建任务
-    task_id = task_manager.create_task(
-        request=request.model_dump(),
-        estimated_seconds=60
-    )
-    
-    # 添加后台任务执行分析
-    background_tasks.add_task(
-        execute_analysis_async,
-        task_id,
-        request.model_dump()
-    )
-    
-    logger.info(f"任务已创建: {task_id}")
-    
+    request_data = request.model_dump()
+    try:
+        task_id, created = task_manager.get_or_create_task(
+            request=request_data,
+            estimated_seconds=60
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+    if created:
+        background_tasks.add_task(execute_analysis_async, task_id, request_data)
+        logger.info(f"任务已创建: {task_id}")
+    else:
+        logger.info(f"复用已有任务，不重复调度: {task_id}")
+
+    task = task_manager.get_task(task_id)
     return TaskSubmitResponse(
         task_id=task_id,
-        status="pending",
-        message="分析任务已提交，正在执行中",
-        estimated_seconds=60
+        status=task["status"],
+        message="分析任务已提交，正在执行中" if created else task["message"],
+        estimated_seconds=task["estimated_seconds"]
     )
 
 
