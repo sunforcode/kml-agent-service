@@ -34,6 +34,9 @@ class AgentState(TypedDict, total=False):
     
     kml_markers: List[Dict[str, Any]]
     """KML标记点列表"""
+
+    source_description: str
+    """Plain text from the source route description, not generated content."""
     
     basic_stats: Optional[Dict[str, Any]]
     """基础统计数据（距离、爬升、下降等）"""
@@ -89,6 +92,9 @@ class AgentState(TypedDict, total=False):
     # ========================================
     generated_content: Optional[Dict[str, Any]]
     """生成的内容（描述、亮点、装备推荐等）"""
+
+    segment_content_facts: List[Dict[str, Any]]
+    """Grounded text units for each existing day/slope range; never model-authored facts."""
     
     # ========================================
     # 质量评估结果（质量评估Agent产出）

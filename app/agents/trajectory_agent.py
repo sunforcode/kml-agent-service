@@ -22,10 +22,11 @@
 
 import logging
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import httpx
 
 from app.agents.base import BaseAgent
+from app.services.segment_content_service import source_text, source_time
 from app.core.track_processor import (
     TrackProcessor,
     create_default_processor,
@@ -111,6 +112,7 @@ class TrajectoryAgent(BaseAgent):
                 elev_stats,
                 additional_features
             )
+            result["source_description"] = self._extract_source_description(kml_content, file_type)
             
             self.log_complete(points_count=len(track_points))
             return result
@@ -199,6 +201,8 @@ class TrajectoryAgent(BaseAgent):
                         "type": self._classify_marker_type(wp.name, wp.description),
                         "confidence": 1.0
                     }
+                    if wp.time is not None and wp.time.tzinfo is not None:
+                        marker["timestamp"] = wp.time.astimezone(timezone.utc).isoformat()
                     markers.append(marker)
                     
             else:  # KML
@@ -238,7 +242,8 @@ class TrajectoryAgent(BaseAgent):
                                         "elevation": elev,
                                         "description": desc,
                                         "type": self._classify_marker_type(name, desc),
-                                        "confidence": 1.0
+                                        "confidence": 1.0,
+                                        **self._marker_source_fields(pm, ns),
                                     })
                         except Exception:
                             continue
@@ -250,6 +255,34 @@ class TrajectoryAgent(BaseAgent):
             logger.warning(f"提取标记点时出错，继续: {e}")
             
         return markers
+
+    @staticmethod
+    def _marker_source_fields(placemark, ns) -> Dict[str, Any]:
+        fields = {}
+        if placemark.get("id"):
+            fields["source_id"] = placemark.get("id")
+        timestamp = source_time(placemark.findtext("kml:TimeStamp/kml:when", namespaces=ns))
+        if timestamp is None:
+            raw = placemark.findtext("kml:ExtendedData/kml:Data[@name='Time']/kml:value", namespaces=ns)
+            if raw:
+                try:
+                    timestamp = datetime.fromtimestamp(int(raw) / 1000, timezone.utc)
+                except (ValueError, OverflowError, OSError):
+                    pass
+        if timestamp is not None:
+            fields["timestamp"] = timestamp.isoformat()
+        return fields
+
+    @staticmethod
+    def _extract_source_description(content: str, file_type: str) -> str:
+        from xml.etree import ElementTree as ET
+
+        root = ET.fromstring(content)
+        if file_type == "gpx":
+            description = root.findtext("{*}metadata/{*}desc") or root.findtext("{*}trk/{*}desc")
+        else:
+            description = root.findtext("{*}Document/{*}description")
+        return source_text(description)
 
     def _classify_marker_type(self, name: str, desc: str) -> str:
         """简单的基于关键词的标记点分类"""

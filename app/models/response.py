@@ -282,6 +282,51 @@ class SegmentSchemeOutput(BaseModel):
         return self
 
 
+class AnalysisRangeAssociation(BaseModel):
+    """A source-range snapshot, never a persisted Segment identity."""
+
+    scheme_type: Literal["day", "slope"]
+    track_start_index: int = Field(ge=0, strict=True)
+    track_end_index: int = Field(ge=0, strict=True)
+    day_number: Optional[int] = Field(default=None, ge=1, strict=True)
+    basis: Literal["explicit_day", "time_and_position", "position"]
+    distance_meters: float = Field(ge=0)
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if self.track_end_index < self.track_start_index:
+            raise ValueError("analysis range end precedes start")
+        if (self.scheme_type == "day") != (self.day_number is not None):
+            raise ValueError("day_number is required only for a day association")
+        return self
+
+
+class CampAnalysis(BaseModel):
+    """Unverified source evidence owned by an existing camp POI."""
+
+    status: Literal["pending_verification"]
+    source: Literal["source_marker"]
+    usage: Literal["recorded_overnight", "along_route", "unknown"]
+    evidence: NonEmptyString
+    associations: List[AnalysisRangeAssociation]
+    unresolved_reason: Optional[NonEmptyString] = None
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_evidence(self):
+        if not self.associations and (self.usage != "unknown" or not self.unresolved_reason):
+            raise ValueError("unassigned camps require unknown usage and an unresolved reason")
+        if self.usage == "recorded_overnight" and not any(a.scheme_type == "day" for a in self.associations):
+            raise ValueError("recorded overnight use requires an associated day")
+        keys = [(a.scheme_type, a.track_start_index, a.track_end_index) for a in self.associations]
+        if len(keys) != len(set(keys)):
+            raise ValueError("camp analysis associations must not repeat")
+        return self
+
+
 class POIOutput(BaseModel):
     """统一 POI 输出。"""
 
@@ -297,6 +342,15 @@ class POIOutput(BaseModel):
     card_data: Optional[Dict[str, Any]] = None
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_camp_analysis(self):
+        if self.card_data is not None and "camp_analysis" in self.card_data:
+            if self.category != "camp" or self.source != "kml_marker":
+                raise ValueError("camp_analysis belongs only to an existing source camp")
+            snapshot = CampAnalysis.model_validate(self.card_data["camp_analysis"])
+            self.card_data = {**self.card_data, "camp_analysis": snapshot.model_dump(mode="json", exclude_none=True)}
+        return self
 
 
 class WarningOutput(BaseModel):
@@ -409,6 +463,24 @@ class EnhancedRouteOutput(BaseModel):
     """原始分析数据（可选）"""
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_camp_ranges(self):
+        ranges = {
+            (scheme.scheme_type, segment.track_start_index, segment.track_end_index): segment
+            for scheme in self.segment_schemes for segment in scheme.segments
+        }
+        for poi in self.poi_points:
+            snapshot = (poi.card_data or {}).get("camp_analysis")
+            if snapshot is None:
+                continue
+            for association in CampAnalysis.model_validate(snapshot).associations:
+                key = (association.scheme_type, association.track_start_index, association.track_end_index)
+                if key not in ranges or association.track_end_index >= len(self.track_path):
+                    raise ValueError("camp association must match an existing input range")
+                if association.scheme_type == "day" and association.day_number != ranges[key].sequence_number:
+                    raise ValueError("camp day_number must match its associated day")
+        return self
 
 
 class POIFilterResultItem(BaseModel):

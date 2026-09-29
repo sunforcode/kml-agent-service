@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: deploy-kml-agent
+  cancel-in-progress: false
+
 jobs:
   deploy:
     name: Deploy kml-agent to walk-server
@@ -15,6 +19,21 @@ jobs:
     steps:
       - name: Checkout kml-agent-service
         uses: actions/checkout@v4
+
+      - name: Validate deployment target
+        env:
+          WALK_SERVER: ${{ secrets.WALK_SERVER }}
+          WALK_REMOTE_DIR: ${{ secrets.WALK_REMOTE_DIR }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$WALK_SERVER" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]; then
+            echo "::error::WALK_SERVER must be a non-empty user@host without whitespace."
+            exit 1
+          fi
+          if [[ ! "$WALK_REMOTE_DIR" =~ ^/[a-zA-Z0-9_/-]+$ ]] || [[ "$WALK_REMOTE_DIR" == / ]]; then
+            echo "::error::WALK_REMOTE_DIR must be an absolute project directory."
+            exit 1
+          fi
 
       - name: Configure SSH
         uses: webfactory/ssh-agent@v0.9.0
@@ -33,12 +52,16 @@ jobs:
           WALK_SERVER: ${{ secrets.WALK_SERVER }}
           WALK_REMOTE_DIR: ${{ secrets.WALK_REMOTE_DIR }}
         run: |
-          rsync -az --delete \
+          set -euo pipefail
+          ssh -o BatchMode=yes "$WALK_SERVER" "test -d '$WALK_REMOTE_DIR/deploy' && test -f '$WALK_REMOTE_DIR/deploy/docker-compose.yml' && test ! -L '$WALK_REMOTE_DIR/kml-agent-service' && mkdir -p '$WALK_REMOTE_DIR/kml-agent-service'"
+          rsync -az -e 'ssh -o BatchMode=yes' \
             --exclude '.git' \
             --exclude '.venv' \
             --exclude '__pycache__' \
             --exclude '*.log' \
             --exclude 'logs' \
+            --exclude '.env' \
+            --exclude '.env.*' \
             . \
             "$WALK_SERVER:$WALK_REMOTE_DIR/kml-agent-service/"
 
@@ -47,5 +70,5 @@ jobs:
           WALK_SERVER: ${{ secrets.WALK_SERVER }}
           WALK_REMOTE_DIR: ${{ secrets.WALK_REMOTE_DIR }}
         run: |
-          ssh "$WALK_SERVER" "cd $WALK_REMOTE_DIR/deploy && docker compose build kml-agent"
-          ssh "$WALK_SERVER" "cd $WALK_REMOTE_DIR/deploy && docker compose up -d kml-agent"
+          set -euo pipefail
+          ssh -o BatchMode=yes "$WALK_SERVER" "cd '$WALK_REMOTE_DIR/deploy' && docker compose build kml-agent && docker compose up -d --no-deps kml-agent"

@@ -37,7 +37,8 @@ from app.core.track_processor import (
     TrackProcessor,
     create_default_processor,
     SegmentType,
-    TrackPoint
+    TrackPoint,
+    TrackSegment,
 )
 
 logger = logging.getLogger(__name__)
@@ -148,7 +149,7 @@ class SegmentationAgent(BaseAgent):
                 enriched_segments.append(enriched)
             
             # 6. 计算按天分段（如果有时间戳）
-            day_segments = self._build_day_segments(points)
+            day_segments = self._build_day_segments(points, segments)
 
             # 7. 组装为 v2 格式（segment_schemes）
             result = self._assemble_result(enriched_segments, day_segments)
@@ -652,7 +653,71 @@ class SegmentationAgent(BaseAgent):
             "overall_progress": 30
         }
 
-    def _build_day_segments(self, points: List[TrackPoint]) -> List[Dict[str, Any]]:
+    def _estimate_day_time(
+        self,
+        points: List[TrackPoint],
+        start_index: int,
+        end_index: int,
+        slope_segments: Optional[List[TrackSegment]],
+    ) -> int:
+        """Sum existing walking estimates within the day, never recording elapsed time."""
+        day_points = points[start_index:end_index + 1]
+        if self._calculate_walkable_distance(day_points) <= 0:
+            return 0
+
+        if slope_segments is None:
+            points = day_points
+            start_index, end_index = 0, len(points) - 1
+            slope_segments = (
+                self._build_slope_segments(points, self.default_strategy)
+                if all(point.elevation is not None for point in points) else []
+            )
+
+        def estimate_range(start: int, end: int, segment: Optional[TrackSegment] = None) -> int:
+            minutes = 0
+            group_start = start
+            for index in range(start + 1, end + 2):
+                if index <= end and points[index].segment_index == points[group_start].segment_index:
+                    continue
+                selected = points[group_start:index]
+                distance_km = self._calculate_walkable_distance(selected)
+                if distance_km > 0:
+                    if segment is not None and group_start == segment.start_index and index - 1 == segment.end_index:
+                        minutes += self._enrich_segment(segment, points, 0, 1)["estimated_time"]
+                    elif any(point.elevation is None for point in selected):
+                        # Partial ranges must not fail on a missing elevation endpoint.
+                        stats = self.processor.calculate_elevation_stats(selected)
+                        minutes += self._estimate_time_naismith(
+                            distance_km, stats.total_gain_m, stats.total_loss_m, 1
+                        )
+                    else:
+                        part = self.processor._create_segment(selected, 0, len(selected) - 1)
+                        if part is not None:
+                            minutes += self._enrich_segment(part, selected, 0, 1)["estimated_time"]
+                group_start = index
+            return minutes
+
+        minutes = 0
+        cursor = start_index
+        for segment in slope_segments:
+            start = max(cursor, segment.start_index)
+            end = min(end_index, segment.end_index)
+            if end <= start:
+                continue
+            # Estimate only uncovered edges; adjacent segments share a point, not an edge.
+            if cursor < start:
+                minutes += estimate_range(cursor, start)
+            minutes += estimate_range(start, end, segment)
+            cursor = end
+        if cursor < end_index:
+            minutes += estimate_range(cursor, end_index)
+        return minutes
+
+    def _build_day_segments(
+        self,
+        points: List[TrackPoint],
+        slope_segments: Optional[List[TrackSegment]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         基于时间间隔计算按天分段列表
 
@@ -696,19 +761,11 @@ class SegmentationAgent(BaseAgent):
             sp = points[start_i]
             ep = points[end_i]
 
-            # 同一天可包含多段录制；距离和高差仍禁止跨原始断段累计。
+            # Reuse the route-level filter; it resets at each recording boundary.
             day_points = points[start_i:end_i + 1]
             total_dist = self._calculate_walkable_distance(day_points)
-            total_gain = 0.0
-            total_loss = 0.0
-            for previous, current in zip(day_points, day_points[1:]):
-                if current.segment_index != previous.segment_index:
-                    continue
-                if current.elevation is None or previous.elevation is None:
-                    continue
-                elevation_change = current.elevation - previous.elevation
-                total_gain += max(0, elevation_change)
-                total_loss += max(0, -elevation_change)
+            elevation_stats = self.processor.calculate_elevation_stats(day_points)
+            estimated_time = self._estimate_day_time(points, start_i, end_i, slope_segments)
 
             seg_id = f"day_{day_idx + 1:02d}"
             day_segment_list.append({
@@ -717,9 +774,9 @@ class SegmentationAgent(BaseAgent):
                 "sequence_number": day_idx + 1,
                 "color": DAY_COLORS[day_idx % len(DAY_COLORS)],  # 每天专属配色，便于地图区分
                 "distance": round(total_dist, 2),
-                "elevation_gain": round(total_gain, 1),
-                "elevation_loss": round(total_loss, 1),
-                "estimated_time": 0,
+                "elevation_gain": elevation_stats.total_gain_m,
+                "elevation_loss": elevation_stats.total_loss_m,
+                "estimated_time": estimated_time,
                 "difficulty": 1,
                 "scheme_type": "day",
                 "track_start_index": start_i,

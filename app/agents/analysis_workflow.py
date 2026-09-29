@@ -47,6 +47,7 @@ from app.agents.poi_agent import POIAgent
 from app.agents.content_agent import ContentAgent
 from app.agents.quality_agent import QualityAgent
 from app.agents.segment_merge_agent import SegmentMergeAgent
+from app.services.segment_content_service import enrich_segment_content
 
 logger = logging.getLogger(__name__)
 
@@ -312,7 +313,17 @@ class AnalysisWorkflow(BaseAgent):
         logger.info("执行POI识别节点")
         
         try:
-            return await self.poi_agent.execute(state)
+            update = await self.poi_agent.execute(state)
+            try:
+                return {**update, **enrich_segment_content({**state, **update})}
+            except Exception as exc:
+                logger.warning("范围内容补齐失败，保留原始POI: %s", type(exc).__name__)
+                return {
+                    **update,
+                    "degraded": True,
+                    "warnings": [{"level": "warning", "message": "范围内容补齐失败，保留原始POI与分段",
+                                  "detail": classify_safe_error(exc)["summary"]}],
+                }
         except Exception as e:
             logger.error(f"POI识别失败: {str(e)}")
             return {
